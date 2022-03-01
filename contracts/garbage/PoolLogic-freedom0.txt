@@ -1,0 +1,1215 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {IAssetERC1155} from '../tokens/AssetERC1155.sol';
+
+import {PoolStorage} from '../pool/PoolStorage.sol';
+import {ICollateralToken} from '../tokens/ICollateralToken.sol';
+import {IAvaToken} from '../tokens/IAvaToken.sol';
+import {IDebtToken} from '../tokens/IDebtToken.sol';
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {WadRayMath} from './WadRayMath.sol';
+import {IExchangeRateData} from '../anchor/IExchangeRateData.sol';
+import {IRouter} from '../anchor/IRouter.sol';
+
+/* import {IBridge} from '../anchor/IBridge.sol'; */
+import {IPriceConsumerV3} from '../oracles/IPriceConsumerV3.sol';
+
+import "hardhat/console.sol";
+
+// actual
+library PoolLogic {
+    using SafeMath for uint256;
+    using WadRayMath for uint256;
+
+    uint256 constant ONE_YR = 31536000;
+    uint256 constant ONE_FACTOR = 1e18;
+
+    function initCollateralToken(
+        PoolStorage.PoolAsset storage collateralAsset,
+        address asset,
+        address collateralAssetWrapped,
+        address exchangeRateData,
+        uint256 bridgeMinSupplyRedeemAmount,
+        uint256 bridgeMaxSupplyRedeemAmount,
+        uint256 collateralInterestRateFactor
+    ) external {
+        (
+          uint256 bridgeExchangeRate,
+          uint256 bridgeInterestRate
+        ) = _getInterestData(exchangeRateData);
+
+        collateralAsset.asset = asset; // ust
+        collateralAsset.decimals = IERC20Metadata(asset).decimals();
+        collateralAsset.collateralExchangeRate = 1e18;
+        collateralAsset.collateralInterestRateFactor = collateralInterestRateFactor;
+        collateralAsset.collateralAssetWrapped = collateralAssetWrapped;
+        collateralAsset.exchangeRateData = exchangeRateData; //address to router to send collateral to anchor
+        collateralAsset.bridgeExchangeRate = bridgeExchangeRate; // storeed byways of anchor exchangeRateFeeder
+        collateralAsset.bridgeInterestRate = bridgeInterestRate; // eestimated by exchangeRateFeeder
+        collateralAsset.bridgeMinSupplyRedeemAmount = bridgeMinSupplyRedeemAmount*(10**collateralAsset.decimals); // min amount bridge allows
+        collateralAsset.bridgeMaxSupplyRedeemAmount = bridgeMaxSupplyRedeemAmount*(10**collateralAsset.decimals);
+        collateralAsset.isCollateral = true;
+        collateralAsset.isSavings = false; // collateral is always called first if there is, will update to true if we init savings and debt asset
+        collateralAsset.reserveFactor = uint256(100000000000000000); // 10%
+        collateralAsset.on = true;
+        collateralAsset.lastUpdatedTimestamp = block.timestamp;
+        /* collateralAsset.liquidationBonusFactorOnSpread = uint256(800000000000000000); // 10% */
+        collateralAsset.liquidationBonusFactor = uint256(200000000000000000); // 10%
+    }
+
+    function initSavingsToken(
+        PoolStorage.PoolAsset storage poolAsset,
+        address asset,
+        address wrapped,
+        address exchangeRateData,
+        uint256 bridgeMinSupplyRedeemAmount,
+        uint256 depositsSuppliedInterestRateFactor
+    ) internal {
+        (
+          uint256 bridgeExchangeRate,
+          uint256 bridgeInterestRate
+        ) = _getInterestData(exchangeRateData);
+
+        poolAsset.isSavings = true;
+        poolAsset.asset = asset;
+        poolAsset.decimals = IERC20Metadata(asset).decimals();
+        poolAsset.wrapped = wrapped;
+        poolAsset.reserveFactor = uint256(100000000000000000); // 10%
+
+        poolAsset.depositsSuppliedExchangeRate = uint256(1e18);
+        poolAsset.overallExchangeRate = uint256(1e18);
+        poolAsset.depositsSuppliedInterestRateFactor = depositsSuppliedInterestRateFactor;
+        poolAsset.depositsSuppliedInterestRate = bridgeInterestRate.wadMul(depositsSuppliedInterestRateFactor);
+
+        // debt asset
+
+        poolAsset.exchangeRateData = exchangeRateData; //address to router to send collateral to anchor
+        poolAsset.bridgeExchangeRate = bridgeExchangeRate; // storeed byways of anchor exchangeRateFeeder
+        poolAsset.bridgeInterestRate = bridgeInterestRate; // eestimated by exchangeRateFeeder
+
+        poolAsset.bridgeMinSupplyRedeemAmount = bridgeMinSupplyRedeemAmount*(10**poolAsset.decimals); // min amount bridge allows
+
+        poolAsset.lastUpdatedTimestamp = block.timestamp;
+
+        poolAsset.on = true;
+    }
+
+    function initDebtToken(
+        PoolStorage.PoolAsset storage poolAsset,
+        address debtWrappedAsset,
+        uint256 debtInterestRateFactor,
+        uint256 ltv
+    ) internal {
+        (
+          ,
+          uint256 bridgeInterestRate
+        ) = _getInterestData(poolAsset.exchangeRateData);
+
+        uint256 borrowInterestRate = bridgeInterestRate.wadMul(debtInterestRateFactor);
+        poolAsset.borrowInterestRate = borrowInterestRate;
+        poolAsset.debtWrappedAsset = debtWrappedAsset; // wrapped asset representing
+        poolAsset.debtInterestRateFactor = debtInterestRateFactor; // percentage of interest rate of collateral rate to be the borrow rate --- 20% (borrow rate) * 50% = 10%
+        poolAsset.borrowInterestRate = bridgeInterestRate.wadMul(debtInterestRateFactor);
+        poolAsset.borrowExchangeRate = uint256(1e18);
+
+        poolAsset.minDebtTimeframe = uint256(5259486); // 2 months
+        poolAsset.maxDebtTimeframe = uint256(7257600); // 3 months
+        poolAsset.fullLiquidationTimeframe = uint256(14515200); // 4 months
+
+        poolAsset.ltv = ltv;
+        poolAsset.maxAmortizationTime = 7257600; // 3 months
+        poolAsset.liquidationThreshold = uint256(1e18);
+
+        poolAsset.minDebtThresholdValue = (2000**poolAsset.decimals); // deebt threshold for 100% liquidation
+        poolAsset.maxDebtLiquidationFactor = uint256(200000000000000000); // 20% of principal is max liquidator can remove
+
+
+    }
+
+    function _getInterestData(address _exchangeRateData) public view returns (uint256, uint256) {
+        (
+            uint256 interestRate,
+            uint256 exchangeRate
+        ) = IExchangeRateData(_exchangeRateData).getInterestData();
+        return (exchangeRate, interestRate);
+    }
+
+    function accrueInterest(
+        PoolStorage.PoolAsset storage poolAsset
+    ) internal {
+        console.log("in accrueInterest");
+        (
+            uint256 bridgeExchangeRate,
+            uint256 bridgeInterestRate
+        ) = _getInterestData(poolAsset.exchangeRateData);
+
+        if (poolAsset.bridgeExchangeRate >= bridgeExchangeRate) {
+            poolAsset.lastUpdatedTimestamp = block.timestamp;
+            return;
+        }
+
+        uint256 bridgeExchangeRateAccrued = bridgeExchangeRate.sub(poolAsset.bridgeExchangeRate);
+        uint256 rateAccrued = bridgeExchangeRateAccrued.wadDiv(poolAsset.bridgeExchangeRate);
+
+        if (poolAsset.isCollateral) {
+            accrueCollateral(
+                poolAsset,
+                rateAccrued
+            );
+        }
+
+        if (poolAsset.isSavings) {
+            // update debt | borrow
+            uint256 debtScaledSupply = IDebtToken(poolAsset.debtWrappedAsset).totalScaledSupply();
+
+            // lended to borrowers
+            uint256 lendableAccrued;
+            // get b4 update
+            uint256 lastUpdatedLendableTotalSupply = poolAsset.totalDepositsLendable;
+
+            // bridged supply
+
+            if (debtScaledSupply != 0) {
+                uint256 lastUpdatedDebtTotalSupply = debtScaledSupply.wadMul(poolAsset.borrowExchangeRate);
+
+                (
+                    uint256 borrowExchangeRate
+                ) = accrueDebt(
+                    poolAsset,
+                    rateAccrued
+                );
+
+                uint256 updatedDebtTotalSupply = debtScaledSupply.wadMul(poolAsset.borrowExchangeRate);
+
+                uint256 debtAccrued = updatedDebtTotalSupply.sub(lastUpdatedDebtTotalSupply);
+
+                // deposits
+                // can lendable supply just use the borrow index?
+                // it can't because bridging may fail and need to rebalance
+                // lended out to borrowers
+                // update lending amounts
+                // lending is done by principal andd not index
+                (
+                    uint256 updatedLendableTotalSupply
+                ) = accrueLendableSupply(
+                    poolAsset,
+                    debtAccrued
+                );
+                lendableAccrued = updatedLendableTotalSupply.sub(poolAsset.totalDepositsLendable);
+
+            }
+
+            // get bridged assets
+            uint256 depositsSuppliedTotalScaledSupply = IAvaToken(poolAsset.wrapped).depositsSuppliedTotalScaledSupply();
+            uint256 lastUpdateDepositsSuppliedTotalScaledSupply = depositsSuppliedTotalScaledSupply.wadMul(poolAsset.depositsSuppliedExchangeRate);
+
+            (
+                uint256 depositsSuppliedExchangeRate
+            ) = accrueDepositsSupplied(
+                poolAsset,
+                rateAccrued
+            );
+
+            uint256 updatedBridgeTotalSupply = depositsSuppliedTotalScaledSupply.wadMul(depositsSuppliedExchangeRate);
+            uint256 bridgeSupplyAccrued = updatedBridgeTotalSupply.sub(lastUpdateDepositsSuppliedTotalScaledSupply);
+
+            // est anchor exchange ratte
+
+            // anchor
+            // get last updated totalSupply of anchor asset Which is principal+interest
+            // get updated totalSupply of anchor asset Which is principal+interest
+            // update variable
+            accrueOverallDepositExchangeRate(
+                poolAsset,
+                lendableAccrued.add(bridgeSupplyAccrued), // aDAI appreciation | amount from anchor since last update
+                lastUpdateDepositsSuppliedTotalScaledSupply.add(lastUpdatedLendableTotalSupply) // previous totalSupply overall
+            );
+        }
+
+        // update
+        poolAsset.lastUpdatedTimestamp = block.timestamp;
+        poolAsset.bridgeExchangeRate = bridgeExchangeRate;
+        poolAsset.bridgeInterestRate = bridgeInterestRate;
+    }
+
+
+    function accrueDepositsSupplied(
+        PoolStorage.PoolAsset storage poolAsset,
+        uint256 rateAccrued
+    ) internal returns (uint256) {
+        uint256 supplyBridgeRateAccrued = rateAccrued.wadMul(poolAsset.depositsSuppliedInterestRateFactor); // accrud/last*depositsSuppliedInterestRateFactor
+        poolAsset.depositsSuppliedExchangeRate = poolAsset.depositsSuppliedExchangeRate.add(poolAsset.depositsSuppliedExchangeRate.wadMul(supplyBridgeRateAccrued));
+        return poolAsset.depositsSuppliedExchangeRate;
+    }
+    // =========================================================
+    // collateral
+
+    function accrueCollateral(
+        PoolStorage.PoolAsset storage collateralAsset,
+        uint256 rateAccrued
+    ) internal {
+        uint256 collateralTotalScaledSupply = ICollateralToken(collateralAsset.collateralAssetWrapped).totalScaledSupply();
+        uint256 previousCollateralTotalSupply = collateralTotalScaledSupply.wadMul(collateralAsset.collateralExchangeRate);
+
+        uint256 collateralPremium = rateAccrued.wadMul(collateralAsset.collateralInterestRateFactor);
+        // get amount with exchangerate without facctoring reserve factor
+        uint256 updatedCollateralTotalSupply = collateralTotalScaledSupply.wadMul(
+                collateralAsset.collateralExchangeRate.add(collateralAsset.collateralExchangeRate.wadMul(collateralPremium)
+            )
+        );
+
+
+        uint256 collateralAccruedRate = collateralPremium.wadMul(ONE_FACTOR.sub(collateralAsset.reserveFactor));
+        collateralAsset.collateralExchangeRate = collateralAsset.collateralExchangeRate.add(collateralAsset.collateralExchangeRate.wadMul(collateralAccruedRate));
+
+        ICollateralToken(collateralAsset.collateralAssetWrapped).mintToReserve((updatedCollateralTotalSupply.sub(previousCollateralTotalSupply)).wadMul(collateralAsset.reserveFactor), collateralAsset.collateralExchangeRate);
+    }
+    // =========================================================
+
+    // =========================================================
+    // lendable supply
+    function accrueLendableSupply(
+        PoolStorage.PoolAsset storage poolAsset,
+        uint256 debtAccrued
+    ) internal returns (uint256) {
+        uint256 lastLendableTotalSupply = IAvaToken(poolAsset.wrapped).lendableTotalSupplyPrincipal(); // total amount loaned or free to lend
+        uint256 totalDepositsLendable = lastLendableTotalSupply.add(debtAccrued); // last updatedd lend + borrower repayments (and suedo repayments)
+        poolAsset.totalDepositsLendable = totalDepositsLendable;
+        return totalDepositsLendable;
+    }
+
+    // =========================================================
+    // debt
+    function accrueDebt(
+        PoolStorage.PoolAsset storage poolAsset,
+        uint256 bridgeExchangeRateAccrued
+    ) internal returns (uint256) {
+        uint256 lastBorrowExchangeRate = poolAsset.borrowExchangeRate;
+        uint256 rateAccrued = bridgeExchangeRateAccrued.wadMul(poolAsset.debtInterestRateFactor); // accrud/last*debtInterestRateFactor
+        poolAsset.borrowExchangeRate = lastBorrowExchangeRate.add(lastBorrowExchangeRate.wadMul(rateAccrued));
+        return poolAsset.borrowExchangeRate;
+    }
+
+    function simulateBorrowExchangeRate(
+        uint256 bridgeExchangeRate, // latest updated
+        uint256 lastUpdatedBridgeExchangeRate,
+        uint256 debtInterestRateFactor,
+        uint256 lastUpdatedBorrowExchangeRate
+    ) external view returns (uint256) {
+        if (lastUpdatedBridgeExchangeRate >= bridgeExchangeRate) { return lastUpdatedBorrowExchangeRate; }
+        // amount accrued since last update
+        uint256 bridgeExchangeRateAccrued = bridgeExchangeRate.sub(lastUpdatedBridgeExchangeRate);
+        uint256 rateAccrued = (bridgeExchangeRateAccrued.wadDiv(lastUpdatedBridgeExchangeRate)).wadMul(debtInterestRateFactor); // accrud/last*debtInterestRateFactor
+        return lastUpdatedBorrowExchangeRate.add(lastUpdatedBorrowExchangeRate.wadMul(rateAccrued));
+    }
+
+
+    struct simulateOverallExchangeRateParams {
+        uint256 overallExchangeRate;
+        uint256 totalDepositsLendable;
+        uint256 debtScaledSupply;
+        uint256 lastUpdatedDepositBridgeTotalSupply;
+        address wrapped;
+        address debtWrappedAsset;
+    }
+
+    function simulateOverallExchangeRate(
+        uint256 overallExchangeRate, // poolAsset.overallExchangeRate
+        uint256 bridgeExchangeRate,
+        uint256 lastUpdatedBridgeExchangeRate, // poolAsset.bridgeExchangeRate,
+        bool isSavings, //poolAsset.isSavings,
+        address debtWrappedAsset,// poolAsset.debtWrappedAsset,
+        uint256 totalDepositsLendable, // poolAsset.totalDepositsLendable,
+        uint256 lastUpdatedBorrowExchangeRate, // poolAsset.borrowExchangeRate,
+        uint256 updatedBorrowExchangeRate,
+        uint256 lastUpdatedDepositSuppliedExchangeRate,
+        uint256 updatedDepositsSuppliedExchangRate,
+        address wrapped, // poolAsset.wrapped
+        uint256 reserveFactor // poolAsset.reserveFactor
+    ) external view returns (uint256) {
+        simulateOverallExchangeRateParams memory params;
+        params.overallExchangeRate = overallExchangeRate;
+        params.totalDepositsLendable = totalDepositsLendable;
+        params.wrapped = wrapped;
+        params.debtWrappedAsset = debtWrappedAsset;
+
+        if (lastUpdatedBridgeExchangeRate >= bridgeExchangeRate) {
+            return params.overallExchangeRate;
+        }
+
+        if (isSavings) {
+
+            // update debt | borrow
+            params.debtScaledSupply = IDebtToken(params.debtWrappedAsset).totalScaledSupply();
+
+            uint256 lendableAccrued;
+
+            if (params.debtScaledSupply != 0) {
+                uint256 lastUpdatedDebtTotalSupply = params.debtScaledSupply.wadMul(lastUpdatedBorrowExchangeRate);
+                uint256 lendableAccrued = params.debtScaledSupply.wadMul(updatedBorrowExchangeRate).sub(lastUpdatedDebtTotalSupply);
+            }
+            // get bridged assets
+            params.lastUpdatedDepositBridgeTotalSupply = IAvaToken(params.wrapped).depositsSuppliedTotalScaledSupply().wadMul(lastUpdatedDepositSuppliedExchangeRate);
+
+            uint256 depositBridgeAccrued = IAvaToken(params.wrapped).depositsSuppliedTotalScaledSupply().wadMul(updatedDepositsSuppliedExchangRate).sub(params.lastUpdatedDepositBridgeTotalSupply);
+
+            return accrueOverallDepositExchangeRateSimulated(
+                params.overallExchangeRate,
+                lendableAccrued.add(depositBridgeAccrued), // aDAI appreciation | amount from anchor since last update
+                params.lastUpdatedDepositBridgeTotalSupply.add(params.totalDepositsLendable), // previous totalSupply overall
+                reserveFactor
+            );
+        }
+    }
+
+    function accrueOverallDepositExchangeRateSimulated(
+        uint256 overallExchangeRate,
+        uint256 totalRepay,
+        uint256 previousTotalSupply,
+        uint256 reserveFactor
+    ) internal view returns (uint256) {
+        if (totalRepay <= 0) {
+            return overallExchangeRate;
+        }
+        return overallExchangeRate.add((overallExchangeRate.wadMul((totalRepay.wadMul(ONE_FACTOR.sub(reserveFactor))).wadDiv(previousTotalSupply))));
+    }
+
+
+    function simulateCollateralExchangeRate(
+        uint256 bridgeExchangeRate,
+        uint256 lastUpdatedBridgeExchangeRate,
+        uint256 lastUpdatedCollateralExchangeRate,
+        uint256 collateralInterestRateFactor,
+        uint256 reserveFactor
+    ) external view returns (uint256) {
+        if (lastUpdatedBridgeExchangeRate >= bridgeExchangeRate) { return lastUpdatedCollateralExchangeRate; }
+        uint256 bridgeExchangeRateAccrued = (bridgeExchangeRate.sub(lastUpdatedBridgeExchangeRate)).wadDiv(lastUpdatedBridgeExchangeRate);
+        uint256 rateAccrued = bridgeExchangeRateAccrued.wadMul(collateralInterestRateFactor).wadMul(ONE_FACTOR.sub(reserveFactor)); // accrud/last*debtInterestRateFactor
+        uint256 updatedCollateralExchangeRate = lastUpdatedCollateralExchangeRate.add(lastUpdatedCollateralExchangeRate.wadMul(rateAccrued));
+        return updatedCollateralExchangeRate;
+    }
+
+
+    // =========================================================
+    // deposit savings
+
+    function simulateLendableTotalSupply(
+        address debtWrappedAsset,
+        uint256 updatedBorrowExchangeRate,
+        uint256 totalDepositsLendable,
+        uint256 bridgeExchangeRate,
+        uint256 lastUpdatedBridgeExchangeRate,
+        uint256 lastUpdatedBorrowExchangeRate
+    ) external view returns (uint256) {
+        if (bridgeExchangeRate <= lastUpdatedBridgeExchangeRate) { return totalDepositsLendable; }
+        uint256 debtTotalScaledSupply = IDebtToken(debtWrappedAsset).totalScaledSupply();
+        uint256 lastUpdatedDebtTotalSupply = debtTotalScaledSupply.wadMul(lastUpdatedBorrowExchangeRate);
+        uint256 debtTotalSupply = debtTotalScaledSupply.wadMul(updatedBorrowExchangeRate);
+        uint256 debtTotalSupplyAccrued = debtTotalSupply.sub(lastUpdatedDebtTotalSupply);
+        uint256 totalDepositsLendable = totalDepositsLendable.add(debtTotalSupplyAccrued);
+        return totalDepositsLendable;
+    }
+
+    function bridgeRemovalOnWithdrawSavings(
+        PoolStorage.PoolAsset storage poolAsset,
+        uint256 amountToWithdraw // amount account withdraw
+    ) internal view returns (uint256) {
+
+        /* uint256 bridgeUnderlyingDecimals = IERC20Metadata(IAvaToken(poolAsset.wrapped).getRouterUnderlying()).decimals(); */
+        /* amountToWithdraw = amountToWithdraw.mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals); */
+        /* console.log("rebalanceBridgeRealTime bridgeUnderlyingDecimals", bridgeUnderlyingDecimals); */
+
+        // current valuee bridged
+        // 700
+        // depositsSuppliedTotalSupply is in the in-house wrapped asset decimals
+        uint256 amountBridged = IAvaToken(poolAsset.wrapped).depositsSuppliedTotalSupply();
+        /* uint256 amountBridged = IAvaToken(poolAsset.wrapped).depositsSuppliedTotalSupply().mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals); */
+        console.log("rebalanceBridgeRealTime amountBridged", amountBridged);
+
+
+        // total value
+        // 1000 - 100
+        // 900
+
+        /* uint256 totalSupply = IERC20(poolAsset.wrapped).totalSupply().mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals); // total amount of assets lends and brige */
+        uint256 totalSupply = IERC20(poolAsset.wrapped).totalSupply(); // total amount of assets lends and brige
+        require(totalSupply >= amountToWithdraw, "Error: Withdraw amount too great");
+
+        totalSupply = totalSupply.sub(amountToWithdraw); // total minus withdraw amount
+        // amount required repay (lends and bridge) to match debt APR
+        // 900 * .14 = 126
+        uint256 amountToAchieve = totalSupply.wadMul(poolAsset.borrowInterestRate);
+        console.log("rebalanceBridgeRealTime amountToAchieve", amountToAchieve);
+
+        // repay amounts
+        // 0
+        uint256 totalDebtReturned = IERC20(poolAsset.debtWrappedAsset).totalSupply().wadMul(poolAsset.borrowInterestRate); // suedo debt returned yr (non-compounded)
+        console.log("rebalanceBridgeRealTime poolAsset.borrowInterestRate", poolAsset.borrowInterestRate);
+
+        // just in case
+        if (totalDebtReturned > amountToAchieve) { return 0; }
+
+        // difference to achieve
+        // 126 - 0 = 126
+        uint256 amountSpreadToAchieve = amountToAchieve.sub(totalDebtReturned);
+        console.log("rebalanceBridgeRealTime amountSpreadToAchieve", amountSpreadToAchieve);
+
+
+
+        // amount needed to send to bridge to achieve difference
+        /* uint256 amountToSupplyToBridgeToAchieveMatch = amountSpreadToAchieve.wadDiv(poolAsset.bridgeInterestRate);
+        console.log("rebalanceBridgeRealTime amountToSupplyToBridgeToAchieveMatch", amountToSupplyToBridgeToAchieveMatch); */
+
+        // accounting to depositors interest rate factor
+        // 126 / .2 = 630
+        uint256 amountToSupplyToBridgeToAchieveMatch = amountSpreadToAchieve.wadDiv(poolAsset.depositsSuppliedInterestRate);
+        /* console.log("rebalanceBridgeRealTime amountToSupplyToBridgeToAchieveMatch", amountToSupplyToBridgeToAchieveMatch); */
+
+        uint256 bridgeRemoveToUser = 0;
+        if (amountBridged >= amountToSupplyToBridgeToAchieveMatch) {
+            // 700 - 630 = 70
+            bridgeRemoveToUser = amountBridged.sub(amountToSupplyToBridgeToAchieveMatch);
+            if (bridgeRemoveToUser < poolAsset.bridgeMinSupplyRedeemAmount) {
+                bridgeRemoveToUser = 0;
+            }
+        }
+        console.log("rebalanceBridgeRealTime bridgeRemoveToUser", bridgeRemoveToUser);
+
+        // example
+        // user gets ~70 from bridge and 30 from contract
+        return bridgeRemoveToUser;
+    }
+
+    // total amount of assets lends and brige
+    // gets the total amount of savings that should be sent to anchor
+    // not accounting for any currently supplied assets
+
+    function bridgeSupplyOnDepositSavings(
+        PoolStorage.PoolAsset storage poolAsset,
+        address router,
+        uint256 amountAdded // 100
+    ) internal returns (uint256) {
+        // 700
+
+        // convert to bridge asset decimals
+        // all protocol assets have same decimals as their underlying asset
+        uint256 bridgeUnderlyingDecimals = IERC20Metadata(IAvaToken(poolAsset.wrapped).getRouterUnderlying()).decimals();
+        console.log("in bridgeSupplyOnDepositSavings after bridgeUnderlyingDecimals", bridgeUnderlyingDecimals);
+        console.log("in bridgeSupplyOnDepositSavings after poolAsset.decimals", poolAsset.decimals);
+
+        /* amountAdded = amountAdded.mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals); */
+
+        uint256 amountBridged = IAvaToken(poolAsset.wrapped).depositsSuppliedTotalSupply();
+        /* uint256 amountBridged = IAvaToken(poolAsset.wrapped).depositsSuppliedTotalSupply().mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals); */
+        console.log("in bridgeSupplyOnDepositSavings after amountBridged", amountBridged);
+
+        // total value
+        // 1000 + 100 = 1100
+        uint256 totalSupply = IERC20(poolAsset.wrapped).totalSupply().add(amountAdded); // total amount of assets lends and brige
+        /* uint256 totalSupply = IERC20(poolAsset.wrapped).totalSupply().mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals).add(amountAdded); // total amount of assets lends and brige */
+        console.log("in bridgeSupplyOnDepositSavings after totalSupply", totalSupply);
+
+        // amount required repay (lends and bridge) to match debt APR
+        // 1100 * .14 = 154
+        uint256 amountToAchieve = totalSupply.wadMul(poolAsset.borrowInterestRate);
+        console.log("in bridgeSupplyOnDepositSavings after amountToAchieve", amountToAchieve);
+
+        // repay amounts
+        // 0
+        /* uint256 totalDebtReturned = IERC20(poolAsset.debtWrappedAsset).totalSupply().mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals).wadMul(poolAsset.borrowInterestRate); // suedo debt returned yr (non-compounded) */
+        uint256 totalDebtReturned = IERC20(poolAsset.debtWrappedAsset).totalSupply().wadMul(poolAsset.borrowInterestRate); // suedo debt returned yr (non-compounded)
+
+
+        console.log("in bridgeSupplyOnDepositSavings after totalDebtReturned", totalDebtReturned);
+        // just in case
+        if (totalDebtReturned > amountToAchieve) { return 0; }
+
+        // difference to achieve
+         // 154 - 0 = 154
+
+        // amount needed to send to bridge to achieve difference
+
+        // accounting to depositors interest rate factor
+        // 154 / .2 = 770
+        uint256 amountToSupplyToBridgeToAchieveMatch = (amountToAchieve.sub(totalDebtReturned)).wadDiv(poolAsset.depositsSuppliedInterestRate);
+        console.log("in bridgeSupplyOnDepositSavings after amountToSupplyToBridgeToAchieveMatch", amountToSupplyToBridgeToAchieveMatch);
+
+        uint256 amountBack = IRouter(router).depositAmountMinusFees(amountToSupplyToBridgeToAchieveMatch.mul(10**bridgeUnderlyingDecimals).div(10**poolAsset.decimals));
+        console.log("in bridgeSupplyOnDepositSavings after amountBack", amountBack);
+
+        amountBack = amountBack.mul(10**poolAsset.decimals).div(10**bridgeUnderlyingDecimals);
+        console.log("in bridgeSupplyOnDepositSavings after amountBack12", amountBack);
+
+        uint256 feesAmount = amountToSupplyToBridgeToAchieveMatch.sub(amountBack);
+        console.log("in bridgeSupplyOnDepositSavings after feesAmount", feesAmount);
+
+        // 773.86390479824937351671708897541 = ((770 / (1-.001)) / (1-.003)) / (1-.001)
+
+        uint256 amountToBridge = amountToSupplyToBridgeToAchieveMatch.add(feesAmount);
+        console.log("in bridgeSupplyOnDepositSavings after amountToBridge", amountToBridge);
+
+        uint256 bridgeAmountToAdd = 0;
+        if (amountToBridge > amountBridged){
+            // 773.86390479824937351671708897541 - 700 = 73.86390479824937351671708897541
+            bridgeAmountToAdd = amountToBridge.sub(amountBridged);
+
+            if (bridgeAmountToAdd < poolAsset.bridgeMinSupplyRedeemAmount) {
+                bridgeAmountToAdd = 0;
+            }
+        }
+
+        console.log("in bridgeSupplyOnDepositSavings after if", bridgeAmountToAdd);
+
+        return bridgeAmountToAdd;
+
+        /* return bridgeAmountToAdd.mul(10**poolAsset.decimals).div(10**bridgeUnderlyingDecimals); */
+    }
+
+    function simulateDepositsSuppliedExchangeRate(
+        uint256 bridgeExchangeRate,
+        uint256 lastUpdatedBridgeExchangeRate,
+        uint256 lastUpdatedDepositsExchangeRate,
+        uint256 depositsSuppliedInterestRateFactor
+    ) internal view returns (uint256) {
+        if (bridgeExchangeRate <= lastUpdatedBridgeExchangeRate) { return lastUpdatedDepositsExchangeRate; }
+        uint256 bridgeExchangeRateAccrued = bridgeExchangeRate.sub(lastUpdatedBridgeExchangeRate);
+        uint256 rateAccrued = bridgeExchangeRateAccrued.wadDiv(lastUpdatedBridgeExchangeRate); // accrud/last*debtInterestRateFactor
+        uint256 lastDepositsSuppliedExchangRate = lastUpdatedDepositsExchangeRate;
+        uint256 depositsSuppliedRateAccrued = rateAccrued.wadMul(depositsSuppliedInterestRateFactor);
+        return lastDepositsSuppliedExchangRate.add(lastDepositsSuppliedExchangRate.wadMul(depositsSuppliedRateAccrued));
+    }
+
+
+    // wrapped exchange rate is the exchange rate of bridged assets for deposits
+
+    function accrueOverallDepositExchangeRate(
+        PoolStorage.PoolAsset storage poolAsset,
+        uint256 totalRepay,
+        uint256 previousTotalSupply
+    ) internal {
+        console.log("in accrueOverallDepositExchangeRate");
+        if (totalRepay <= 0) {
+            return;
+        }
+        console.log("after totalRepay");
+
+        uint256 lastUpdatedOverallDepositIndex = poolAsset.overallExchangeRate;
+
+        poolAsset.overallExchangeRate = lastUpdatedOverallDepositIndex.add((lastUpdatedOverallDepositIndex.wadMul((totalRepay.wadMul(ONE_FACTOR.sub(poolAsset.reserveFactor))).wadDiv(previousTotalSupply))));
+        // send 10% to reserves
+        console.log("after overallExchangeRate");
+
+        IAvaToken(poolAsset.wrapped).mintToSharedTreasury(totalRepay.wadMul(poolAsset.reserveFactor), poolAsset.overallExchangeRate);
+    }
+
+    function getAssetSavingsInterestRate(
+        address wrapped,
+        uint256 lendRate,
+        uint256 savingsBridgeRate,
+        uint256 totalDebt,
+        uint256 lendTotalSupply,
+        uint256 savingsBridgeTotalSupply
+    ) internal view returns (uint256) {
+        uint256 lendInterestReturn;
+        if (totalDebt != 0) {
+            lendInterestReturn = totalDebt.wadMul(lendRate);
+        }
+        uint256 totalSupplySimulated = lendTotalSupply.add(savingsBridgeTotalSupply);
+        // weighted avgs
+        uint256 savingsBridgeInterestReturn = savingsBridgeTotalSupply.wadMul(savingsBridgeRate);
+        uint256 totalInterestReturn = lendInterestReturn.add(savingsBridgeInterestReturn);
+        if (totalInterestReturn == 0 || totalSupplySimulated == 0) { return 0; }
+        return totalInterestReturn.wadDiv(totalSupplySimulated);
+    }
+
+    function validateLiquidationCall(
+        PoolStorage.PoolAsset storage collateralAsset,
+        PoolStorage.PoolAsset storage debtAsset,
+        /* PoolStorage.UserData storage userData, */
+        address borrower
+    ) internal view {
+        /* require(block.timestamp.sub(userData.startTimestamp) > debtAsset.maxDebtTimeframe, "Error: Max debt timeframe not yet breached"); */
+        require(collateralAsset.on && debtAsset.on, "Error: One or both assets paused.");
+        uint256 borrowerDebt = IERC20(debtAsset.debtWrappedAsset).balanceOf(borrower);
+        require(borrowerDebt != 0, "Error: Borrower has no debt.");
+    }
+
+    function validateBorrowAndGetData(
+        PoolStorage.PoolAsset storage collateralAsset,
+        PoolStorage.PoolAsset storage debtAsset,
+        uint256 collateralValueAvailableInEth,
+        address user,
+        address priceOracle,
+        uint256 debtAmount
+    ) internal view {
+        require(collateralAsset.isCollateral && debtAsset.isSavings, "Error: Collateral is not collateral asset or Debt asset is not debt asset.");
+        // bridge will revert if not enough
+        uint256 availableAmount = IERC20(debtAsset.asset).balanceOf(debtAsset.wrapped);
+        require(availableAmount >= debtAmount, "Error: Not enough liquidity.");
+
+        uint256 availableAmountValueInEth = getValueInEth(
+            debtAsset.asset,
+            debtAsset.decimals,
+            debtAmount,
+            priceOracle
+        );
+
+        require(collateralValueAvailableInEth >= availableAmountValueInEth, "Error: Not enough collateral value available.");
+    }
+
+
+    function validateDepositCollateralAndBorrow(
+        PoolStorage.PoolAsset storage collateralAsset,
+        PoolStorage.PoolAsset storage debtAsset,
+        PoolStorage.UserData storage userData,
+        address priceOracle,
+        uint256 collateralAmount,
+        uint256 borrowAmount
+    ) internal {
+        /* require(!userData.borrowing, "Error: Position open, try using another wallet address"); */
+        require(collateralAsset.isCollateral && debtAsset.isSavings, "Error: Collateral is not collateral asset or Debt asset is not debt asset.");
+        // bridge will revert if not enough
+        uint256 availableAmount = IERC20(debtAsset.asset).balanceOf(debtAsset.wrapped);
+        uint256 borrowAmount = getAssetValueMatchAmountFromAsset(
+            priceOracle,
+            borrowAmount,
+            collateralAsset.decimals,
+            debtAsset
+        );
+        require(availableAmount >= borrowAmount, "Error: Not enough liquidity.");
+
+        if (!userData.borrowing) {
+            userData.lastAmortizationTimestamp = block.timestamp;
+            userData.startTimestamp = block.timestamp;
+        }
+        userData.borrowing = true;
+        // get user health
+    }
+
+    function validateDepositSavings(
+        PoolStorage.PoolAsset storage poolAsset
+    ) internal view {
+        require(poolAsset.isSavings && poolAsset.on, "Error: Not savings asset.");
+
+        // bridge will revert is amount too low
+        /* require(poolAsset.on, "Error: This asset is currently off."); */
+    }
+
+    function confirmCollateralWithdrawAmount(
+        PoolStorage.Position storage position,
+        PoolStorage.PoolAsset storage collateralAsset,
+        uint256 amount,
+        uint256 averageLtvThreshold,
+        address priceOracle
+    ) internal view returns (uint256) {
+        uint256 collateral = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAndPrincipal(msg.sender);
+        console.log("confirmCollateralWithdrawAmount collateral", collateral);
+
+        uint256 collateralValue = getValueInEth(
+            collateralAsset.asset,
+            collateralAsset.decimals,
+            collateral,
+            priceOracle
+        );
+        console.log("confirmCollateralWithdrawAmount collateralValue1", collateralValue);
+
+        collateralValue = collateralValue.mul(10**collateralAsset.decimals).div(10**18);
+
+        console.log("confirmCollateralWithdrawAmount collateralValue2", collateralValue);
+        console.log("confirmCollateralWithdrawAmount averageLtvThreshold1", averageLtvThreshold);
+
+        /* averageLtvThreshold = averageLtvThreshold.div(collateralValue); */
+
+        console.log("confirmCollateralWithdrawAmount averageLtvThreshold2", averageLtvThreshold);
+
+        require(averageLtvThreshold < collateralValue, "Error: Max LTV threshold");
+
+
+        uint256 maxWithdrawValue = collateralValue.sub(averageLtvThreshold).mul(10**18).div(10**collateralAsset.decimals);
+        console.log("confirmCollateralWithdrawAmount maxWithdrawValue", maxWithdrawValue);
+
+        uint256 maxWithdraw = getAmountFromValueInEth(
+            collateralAsset.asset,
+            collateralAsset.decimals,
+            maxWithdrawValue,
+            priceOracle
+        );
+        console.log("confirmCollateralWithdrawAmount maxWithdraw", maxWithdraw);
+
+        if (amount > maxWithdraw) {
+            amount = maxWithdraw;
+        }
+
+        return amount;
+    }
+
+    function confirmRepayAmount(
+        address debtWrappedAsset,
+        PoolStorage.Position storage position,
+        uint256 amount
+    ) internal view returns (uint256, uint256, uint256) {
+        uint256 debt = IAssetERC1155(debtWrappedAsset).balanceOf(msg.sender, position.collateralAsset);
+        uint256 debtPrincipal = IDebtToken(debtWrappedAsset).balanceOfPrincipal(msg.sender, position.collateralAsset);
+
+        uint256 repayAmount = amount;
+        // if amount sent > asset debt owed, update to owed
+        if (amount > debt) {
+            repayAmount = debt;
+        }
+        uint256 debtInterest = debt.sub(debtPrincipal);
+        uint256 removedFromPrincipal;
+        if (repayAmount > debtInterest) {
+            removedFromPrincipal = repayAmount.sub(debtInterest);
+        }
+
+        return (debt, removedFromPrincipal, repayAmount);
+    }
+
+    function updateState(
+        PoolStorage.PoolAsset storage collateralAsset,
+        PoolStorage.PoolAsset storage debtAsset,
+        address account,
+        uint256 amountRemoved,
+        PoolStorage.Position storage position
+    ) internal {
+        position.collateralAsset = collateralAsset.asset;
+        uint256 debt = IAssetERC1155(debtAsset.debtWrappedAsset).balanceOf(account, position.collateralAsset);
+        uint256 debtPrincipal = IDebtToken(debtAsset.debtWrappedAsset).balanceOfPrincipal(account, position.collateralAsset);
+        if (amountRemoved >= debt.sub(debtPrincipal)) {
+            position.lastAmortizationTimestamp = block.timestamp;
+        }
+        position.borrowing = true;
+        if (amountRemoved >= debt) {
+            position.borrowing = false;
+        }
+    }
+
+    function validateRepay(
+        PoolStorage.PoolAsset storage debtAsset,
+        uint256 repayAmount,
+        uint256 debt
+    ) internal view {
+
+        require(repayAmount != 0 && debt != 0, "Error: Repay and debt must be zero.");
+
+
+        require(
+          debtAsset.on &&
+          debtAsset.isSavings,
+          "Error: Pool currently not active."
+        );
+    }
+
+    function validateRepayAndWithdraw(
+        PoolStorage.PoolAsset storage debtAsset,
+        PoolStorage.PoolAsset storage collateralAsset,
+        /* PoolStorage.UserData storage userData, */
+        uint256 repayAmount,
+        uint256 debt
+    ) internal view {
+        if (debt != 0) {
+            require(repayAmount > 0 && debt > 0, "Error: Repay is zero or debt is zero.");
+
+            /* require(block.timestamp.sub(userData.startTimestamp) > debtAsset.minDebtTimeframe, "Error: Min debt timeframe not yet breached"); */
+        } else {
+            // if user fully liquidated, repay in should be 0
+            require(repayAmount == 0 && debt == 0, "Error: Repay and debt must be zero.");
+        }
+
+        require(
+          collateralAsset.on &&
+          debtAsset.on &&
+          debtAsset.isSavings &&
+          collateralAsset.isCollateral,
+          "Error: Pool currently not active."
+        );
+    }
+
+    function validateWithdrawSavings(
+        PoolStorage.PoolAsset storage poolAsset,
+        address account,
+        uint256 amount,
+        uint256 redeemToAccountAmount
+    ) internal view {
+        require(IERC20(poolAsset.wrapped).balanceOf(account) >= amount, "Error: Amount is higher than balance.");
+        require(amount.sub(redeemToAccountAmount) <= IERC20(poolAsset.asset).balanceOf(poolAsset.wrapped), "Error: Not enough liquidity, try lowering withdraw total.");
+        require(poolAsset.isSavings && poolAsset.on, "Error: Pool currently not active.");
+    }
+
+    function idleCollateral(
+        address user,
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(uint256 => address) storage collateralAssetsList,
+        uint256 collateralAssetsCount,
+        uint256 value,
+        address priceOracle
+    ) internal view {
+        for (uint256 i = 0; i < collateralAssetsCount; i++) {
+            address currentPoolAssetAddress = collateralAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+
+            uint256 collateralAmount = getAmountFromValueInEth(
+                currentPoolAssetAddress,
+                currentPoolAsset.decimals,
+                value,
+                priceOracle
+            );
+        }
+    }
+
+    function getUserTotalDebtInCollateral(
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(address => mapping(address => mapping(address => PoolStorage.Position))) storage positions,
+        mapping(uint256 => address) storage savingsAssetsList,
+        uint256 savingsAssetsCount,
+        address account,
+        address collateralAsset,
+        uint256 collateralDecimals,
+        address priceOracle
+    ) internal view returns (uint256) {
+        uint256 totalDebt;
+        for (uint256 i = 0; i < savingsAssetsCount; i++) {
+            address currentPoolAssetAddress = savingsAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+            PoolStorage.Position storage currentPosition = positions[collateralAsset][currentPoolAssetAddress][msg.sender];
+            if (!currentPosition.borrowing) {
+                continue;
+            }
+            uint256 debt = IAssetERC1155(currentPoolAsset.debtWrappedAsset).balanceOf(account, collateralAsset);
+            totalDebt += debt.mul(10**collateralDecimals).div(10**currentPoolAsset.decimals);
+        }
+        return totalDebt;
+    }
+
+    struct getUserTotalDebtValueInCollateralParams {
+        uint256 savingsAssetsCount;
+        address account;
+        address collateralAsset;
+        uint256 collateralDecimals;
+        address priceOracle;
+        uint256 totalDebt;
+        uint256 averageLtvThreshold;
+    }
+
+    function getUserTotalDebtValueInCollateral(
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(address => mapping(address => mapping(address => PoolStorage.Position))) storage positions,
+        mapping(uint256 => address) storage savingsAssetsList,
+        uint256 savingsAssetsCount,
+        address account,
+        address collateralAsset,
+        uint256 collateralDecimals,
+        address priceOracle
+    ) internal view returns (uint256, uint256) {
+        getUserTotalDebtValueInCollateralParams memory params;
+        params.savingsAssetsCount = savingsAssetsCount;
+        params.account = account;
+        params.collateralAsset = collateralAsset;
+        params.collateralDecimals = collateralDecimals;
+        params.priceOracle = priceOracle;
+
+        params.totalDebt;
+        params.averageLtvThreshold;
+
+
+        for (uint256 i = 0; i < params.savingsAssetsCount; i++) {
+            address currentPoolAssetAddress = savingsAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+            PoolStorage.Position storage currentPosition = positions[params.collateralAsset][currentPoolAssetAddress][msg.sender];
+            if (!currentPosition.borrowing) {
+                continue;
+            }
+            uint256 debt = IAssetERC1155(currentPoolAsset.debtWrappedAsset).balanceOf(params.account, params.collateralAsset);
+            console.log("getUserTotalDebtValueInCollateral debt", debt);
+
+            uint256 debtValue = getValueInEth(
+                currentPoolAsset.asset,
+                currentPoolAsset.decimals,
+                debt,
+                params.priceOracle
+            ).mul(10**params.collateralDecimals).div(10**18);
+            console.log("getUserTotalDebtValueInCollateral debtValue", debtValue);
+
+            /* totalDebt += debt.mul(10**collateralDecimals).div(10**currentPoolAsset.decimals); */
+
+            uint256 liquidationThreshold = currentPoolAsset.liquidationThreshold;
+            params.averageLtvThreshold = params.averageLtvThreshold.add(
+                debtValue.wadMul(liquidationThreshold)
+            );
+
+            params.totalDebt += debtValue;
+        }
+
+        console.log("getUserTotalDebtValueInCollateral averageLtvThreshold", params.averageLtvThreshold);
+
+        return (params.totalDebt, params.averageLtvThreshold);
+    }
+
+
+    /* function getUserTotalDebt(
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(uint256 => address) storage savingsAssetsList,
+        uint256 savingsAssetsCount,
+        address account,
+        uint256 currentDebtAssetDecimals
+    ) internal view returns (uint256) {
+        uint256 totalDebt;
+        for (uint256 i = 0; i < savingsAssetsCount; i++) {
+            address currentPoolAssetAddress = savingsAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+            uint256 balance = IERC20(currentPoolAsset.debtWrappedAsset).balanceOf(account);
+            totalDebt += balance.div(10**currentPoolAsset.decimals).mul(10**currentDebtAssetDecimals);
+        }
+        return totalDebt;
+    } */
+
+
+    // return in 18 ddeimals
+    function getUserTotalDeposits(
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(uint256 => address) storage savingsAssetsList,
+        uint256 savingsAssetsCount,
+        address account
+    ) internal view returns (uint256) {
+        uint256 totalSavings;
+        for (uint256 i = 0; i < savingsAssetsCount; i++) {
+            address currentPoolAssetAddress = savingsAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+            uint256 balance = IERC20(currentPoolAsset.wrapped).balanceOf(account);
+            if (currentPoolAsset.decimals != uint256(18)) {
+                totalSavings += balance.mul(10**18).div(10**currentPoolAsset.decimals);
+            } else {
+                totalSavings += balance;
+            }
+        }
+        return totalSavings;
+    }
+
+    // returns 1:1 amount:amount from:to to as in poolAsset
+    function getAssetValueMatchAmountFromAsset(
+        address priceOracle,
+        uint256 fromAmount,
+        uint256 fromAssetDecimals,
+        PoolStorage.PoolAsset storage poolAsset
+    ) internal view returns (uint256) {
+        uint256 toAssetDecimals = poolAsset.decimals;
+
+        uint256 toAssetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(poolAsset.asset));
+
+        uint8 priceDecimals = IPriceConsumerV3(priceOracle).decimals(poolAsset.asset);
+
+        uint256 _amount = fromAmount;
+        if (toAssetDecimals != fromAssetDecimals) {
+            if (toAssetDecimals > fromAssetDecimals) {
+                uint256 difference = toAssetDecimals.sub(fromAssetDecimals);
+                _amount = fromAmount.mul(10**difference);
+            } else {
+                uint256 difference = fromAssetDecimals.sub(toAssetDecimals);
+                _amount = fromAmount.div(10**difference);
+            }
+        }
+        return _amount.mul(uint256(toAssetPrice)).div(10**uint256(priceDecimals));
+    }
+
+    // amount must be 18 decimals
+    // converts from value to asset amount in asset decimals
+    function getAmountFromValueInEth(
+        /* PoolStorage.PoolAsset storage poolAsset, */
+        address asset,
+        uint256 decimals,
+        uint256 amount,
+        address priceOracle
+    ) internal view returns (uint256) {
+        /* uint256 decimals = poolAsset.decimals; */
+        console.log("getAmountFromValueInEth amount", amount);
+
+        amount = amount.mul(10**decimals).div(10**18);
+
+        uint256 price = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(asset));
+
+        uint8 priceDecimals = IPriceConsumerV3(priceOracle).decimals(asset);
+
+        /* uint256 _ether = uint256(18);
+        if (decimals != _ether) {
+            if (decimals > _ether) {
+                uint256 difference = decimals.sub(_ether);
+                amount = amount.mul(10**difference);
+            } else {
+                uint256 difference = _ether.sub(decimals);
+                amount = amount.div(10**difference);
+            }
+        } */
+        /* return amount.div(price); */
+        return amount.mul(uint256(price)).div(10**uint256(priceDecimals));
+    }
+
+    function getValueInEth(
+        /* PoolStorage.PoolAsset storage poolAsset, */
+        address asset,
+        uint256 decimals,
+        uint256 amount,
+        address priceOracle
+    ) internal view returns (uint256) {
+        /* uint256 decimals = poolAsset.decimals; */
+        console.log("getValueInEth amount", amount);
+        uint256 price = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(asset));
+        console.log("getValueInEth price ", price);
+
+        uint8 priceDecimals = IPriceConsumerV3(priceOracle).decimals(asset);
+        console.log("getValueInEth priceDecimals", priceDecimals);
+        console.log("getValueInEth decimals", decimals);
+
+        uint256 _ether = uint256(18);
+        if (decimals != _ether) {
+            if (decimals > _ether) {
+                uint256 difference = decimals.sub(_ether);
+                amount = amount.div(10**difference);
+            } else {
+                uint256 difference = _ether.sub(decimals);
+                amount = amount.mul(10**difference);
+            }
+        }
+        console.log("getValueInEth amount after", amount);
+
+        console.log("getValueInEth reeturn", amount.mul(uint256(price)).div(10**uint256(priceDecimals)));
+
+        return amount.mul(uint256(price)).div(10**uint256(priceDecimals));
+    }
+
+    /* function updateCollateralIdle(
+        address user,
+        address collateralAsset,
+        uint256 collateralAssetDecimals,
+        address collateralAssetWrapped,
+        uint256 collateralAssetsFactor,
+        address debtAsset,
+        uint256 debtAssetDecimals,
+        uint256 repayAmount,
+        address priceOracle
+    ) internal {
+        console.log("updateCollateralIdle repayAmount", repayAmount);
+        console.log("updateCollateralIdle repayAmount.wadMul(collateralAssetsFactor)", repayAmount.wadMul(collateralAssetsFactor));
+
+        uint256 repayValueInEth = getValueInEth(
+            debtAsset,
+            debtAssetDecimals,
+            repayAmount.wadMul(collateralAssetsFactor),
+            priceOracle
+        );
+        console.log("updateCollateralIdle repayValueInEth", repayValueInEth);
+
+        uint256 collateralAmountFromRepayInEth = getAmountFromValueInEth(
+            collateralAsset,
+            collateralAssetDecimals,
+            repayValueInEth,
+            priceOracle
+        );
+        console.log("updateCollateralIdle collateralAmountFromRepayInEth", collateralAmountFromRepayInEth);
+
+        ICollateralToken(collateralAssetWrapped).idleOnRepay(user, collateralAmountFromRepayInEth);
+    } */
+
+    function updateCollateralIdle(
+        address user,
+        PoolStorage.PoolAsset storage collateralAsset,
+        address debtAsset,
+        uint256 debtAssetDecimals,
+        uint256 repayAmount,
+        address priceOracle
+    ) internal {
+        console.log("updateCollateralIdle repayAmount", repayAmount);
+
+
+        uint256 repayValueInEth = getValueInEth(
+            debtAsset,
+            debtAssetDecimals,
+            repayAmount,
+            priceOracle
+        );
+        console.log("updateCollateralIdle repayValueInEth", repayValueInEth);
+
+        uint256 collateralAmountFromRepayInEth = getAmountFromValueInEth(
+            collateralAsset.asset,
+            collateralAsset.decimals,
+            repayValueInEth,
+            priceOracle
+        );
+        console.log("updateCollateralIdle collateralAmountFromRepayInEth", collateralAmountFromRepayInEth);
+
+        ICollateralToken(collateralAsset.collateralAssetWrapped).idleOnRepay(user, collateralAmountFromRepayInEth, collateralAsset.collateralExchangeRate);
+    }
+
+    function validateWithdrawCollateralAmount(
+        uint256 totalCollateral,
+        uint256 withdrawAmount
+    ) internal view {
+        require(withdrawAmount > uint256(10e18), "Error: Withdraw amount must be more than 10");
+        require(totalCollateral.sub(withdrawAmount) > uint256(10e18), "Error: Resulting leftover amount must be more than 10");
+    }
+
+
+    /* function updateCollateralIdle(
+        address user,
+        address collateralAsset,
+        uint256 collateralAssetDecimals,
+        address collateralAssetWrapped,
+        address debtAsset,
+        uint256 debtAssetDecimals,
+        uint256 repayAmount,
+        address priceOracle
+    ) internal {
+        console.log("updateCollateralIdle repayAmount", repayAmount);
+        console.log("updateCollateralIdle repayAmount.wadMul(collateralAssetsFactor)", repayAmount.wadMul(collateralAssetsFactor));
+
+        uint256 repayValueInEth = getValueInEth(
+            debtAsset,
+            debtAssetDecimals,
+            repayAmount,
+            priceOracle
+        );
+        console.log("updateCollateralIdle repayValueInEth", repayValueInEth);
+
+        uint256 collateralAmountFromRepayInEth = getAmountFromValueInEth(
+            collateralAsset,
+            collateralAssetDecimals,
+            repayValueInEth,
+            priceOracle
+        );
+        console.log("updateCollateralIdle collateralAmountFromRepayInEth", collateralAmountFromRepayInEth);
+
+        ICollateralToken(collateralAssetWrapped).idleOnRepay(user, collateralAmountFromRepayInEth);
+    } */
+
+
+    function getCollateralValueAvailableInEth(
+        mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+        mapping(uint256 => address) storage collateralAssetsList,
+        uint256 collateralAssetsCount,
+        address user,
+        uint256 amount,
+        address priceOracle
+    ) internal view returns (uint256) {
+        uint256 valueAvailableInEth;
+        for (uint256 i = 0; i < collateralAssetsCount; i++) {
+            address currentPoolAssetAddress = collateralAssetsList[i];
+            PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+            if (!currentPoolAsset.isCollateral) {
+                continue;
+            }
+            uint256 balanceAvailable = ICollateralToken(currentPoolAsset.collateralAssetWrapped).balanceOfAvailablePrincipal(user);
+            valueAvailableInEth += getValueInEth(
+                currentPoolAssetAddress,
+                currentPoolAsset.decimals,
+                balanceAvailable,
+                priceOracle
+            );
+        }
+        return valueAvailableInEth;
+    }
+
+
+}

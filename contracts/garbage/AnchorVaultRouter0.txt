@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+
+import {IExchangeRateFeeder} from "./interfaces/IExchangeRateFeeder.sol";
+import {IConversionRouterV2} from "./interfaces/IRouterV2.sol";
+import {IRouterV2} from "./interfaces/IRouterV2.sol";
+import {ExchangeRateFeederData} from './interfaces/IExchangeRateFeeder.sol';
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from '../pool/IPoolAddressesProvider.sol';
+import {ISwapper} from "../swapper/ISwapper.sol";
+import {IBridge} from "./IBridge.sol";
+
+contract AnchorVaultRouter {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+    using WadRayMath for uint256;
+
+    bool public routerOpen;
+    address public anchorVault;
+
+    IPoolAddressesProvider private addressesProvider;
+
+    IERC20 private AUST = IERC20(0xa8De3e3c934e2A1BB08B010104CcaBBD4D6293ab);
+    IERC20 private UST = IERC20(0xa47c8bf37f92abed4a126bda807a7b7498661acd);
+    uint256 public AUSTdecimals = 18;
+
+    uint256 public USTdecimals = 18;
+
+    address private collateralToken;
+
+    uint256 public defaultMinOutFactor = 995000000000000000;
+
+    constructor(
+        IPoolAddressesProvider _addressesProvider,
+        address collateralToken
+    ) {
+        addressesProvider = _addressesProvider;
+        initData();
+        routerOpen = true;
+    }
+
+    function setVaultOpen(bool _b) public onlyPoolAdmin {
+        routerOpen = _b;
+    }
+
+    function addRouterAssets(address[] memory assets) public onlyPoolAdmin {
+        for (uint256 i = 0; i < assets.length; i++) {
+            addRouterAsset(assets[i]);
+        }
+    }
+
+    function addRouterAsset(address asset) public onlyPoolAdmin {
+        RouterAsset storage routerAsset = routerAssets[asset];
+        uint256 assetDecimals = IERC20Metadata(asset).decimals();
+        routerAsset.asset = asset;
+        routerAsset.decimals = assetDecimals;
+        routerAsset.minOutFactor = defaultMinOutFactor;
+        routerAsset.on = true;
+        addAssetToListInternal(asset);
+    }
+
+    function setExchangeRateFeederData(address _feederData) public onlyPoolAdmin {
+        feederData = ExchangeRateFeederData(_feederData);
+    }
+
+    modifier onlyCollateralToken() {
+        require(msg.sender == addressesProvider.getBridgeFactory() || msg.sender == addressesProvider.getPoolAdmin());
+        _;
+    }
+
+    modifier onlyPoolAdmin() {
+        require(msg.sender == addressesProvider.getPoolAdmin());
+        _;
+    }
+
+    struct RouterAsset {
+        address asset;
+        uint256 decimals;
+        uint256 minOutFactor;
+        bool on;
+    }
+
+    uint256 internal routerAssetsCount;
+    mapping(uint256 => address) public routerAssetsList;
+    mapping(address => RouterAsset) public routerAssets;
+
+
+    function addRouterAssetToListInternal(address asset) internal {
+        uint256 _routerAssetsCount = routerAssetsCount;
+        bool assetAlreadyAdded = false;
+        for (uint256 i = 0; i < _routerAssetsCount; i++)
+            if (routerAssetsList[i] == asset) {
+                assetAlreadyAdded = true;
+            }
+        if (!assetAlreadyAdded) {
+            routerAssetsList[routerAssetsCount] = asset;
+            routerAssetsCount = _routerAssetsCount + 1;
+        }
+    }
+
+
+    function setCollateralToken(address _collateralToken) public onlyPoolAdmin {
+        UST.safeIncreaseAllowance(anchorVault, type(uint256).max);
+        AUST.safeIncreaseAllowance(anchorVault, type(uint256).max);
+    }
+
+    function routerOpen() external view returns (bool) {
+        return routerOpen;
+    }
+
+    // check if enough aust if x_amount of ust deposited
+    function vaultOpenAndAUSTAvailable(uint256 ustAmount) external view returns (bool) {
+        return vaultOpenAndAUSTAvailable(ustAmount)
+    }
+
+    // check if enough ust if x_amount of aust redeemed
+    function vaultOpenAndUSTAvailable(uint256 austAmount) external view returns (bool) {
+        return vaultOpenAndUSTAvailable(austAmount);
+    }
+
+
+    function depositStable(address asset, uint256 _amount, uint256 _minAmountOut, address to)
+        public
+        override
+        returns (uint256)
+    {
+        require(routerOpen, "Error: Vault closed");
+
+        RouterAsset storage routerAsset = routerAssets[asset];
+        require(routerAsset.on, "Error: Router asset not active");
+
+        inputToken.safeTransferFrom(_msgSender(), address(this), _amount);
+
+        // swap for UST
+        if (address(UST) != routerAsset.asset) {
+            // get amount bacck from uniswap including fees
+            uint256 amountOut = swapper.getAmountOutMin(
+                address(UST),
+                routerAsset.asset, // non-ust
+                _amount
+            );
+
+            if (_amount.wadMul(minOutFactor) < amountOut)
+            // swap to UST
+            swapper.swapToken(
+                routerAsset.asset,
+                address(UST),
+                _amount,
+                _minAmountOut,
+                address(this)
+            );
+        }
+
+        uint256 ust = UST.balanceOf(address(this));
+
+        IAnchorVault(anchorVault).depositStable(to, ust);
+
+        uint256 aust = AUST.balanceOf(address(this));
+
+        return aust;
+    }
+
+    function redeemStable(address asset, uint256 _amount, address to) public override returns (uint256) {
+        require(isRedemptionAllowed, "Error: redemption not allowed");
+
+        // transfer aUST in
+        AUST.safeTransferFrom(_msgSender(), address(this), _amount);
+
+        IAnchorVault(anchorVault).redeemStable(_amount, to, asset);
+
+        uint256 ust = UST.balanceOf(address(this));
+
+        return ust;
+    }
+
+    /// no revert version
+    function redeemStableNR(address asset, uint256 _amount, address to) public override returns (uint256) {
+        if (!isRedemptionAllowed) {
+            return 0;
+        }
+        AUST.safeTransferFrom(_msgSender(), address(this), _amount);
+
+        IAnchorVault(anchorVault).redeemStableNoRevert(_amount, to, asset);
+
+        uint256 ust = UST.balanceOf(address(this));
+
+        return ust;
+
+    }
+
+}

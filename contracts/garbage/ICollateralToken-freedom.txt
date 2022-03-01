@@ -1,0 +1,68 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+interface ICollateralToken {
+
+  event BridgeDeposit(
+      address account,
+      uint256 amount
+  );
+
+  event BridgeRedeem(
+      address account,
+      uint256 amount
+  );
+
+
+  event Mint(
+      address account,
+      uint256 amount,
+      uint256 exchangeRate
+  );
+
+  event Burn(
+      address account,
+      address recieverOfUnderlying,
+      uint256 amount,
+      uint256 exchangeRate
+  );
+
+  function initRouter() external;
+
+  function deposit(address account, uint256 amount) external returns (bool);
+
+  function redeemIdle(address account, uint256 amount) external;
+
+  function idleOnRepay(address account, uint256 amount, uint256 exchangeRate) external;
+  /* function idleOnRepay(address account, uint256 amount) external; */
+
+  function mintOnBorrow(address account, uint256 amount, uint256 exchangeRate) external;
+
+  function supplyLiquidityVault(address asset, address vault) external;
+
+  function balanceOfAndPrincipal(address account) external view returns (uint256);
+
+  function mint(address account, uint256 amount, uint256 exchangeRate) external returns (uint256, uint256);
+
+  function mintToReserve(uint256 amount, uint256 exchangeRate) external;
+
+  function burn(address account, address reciever, uint256 amount, uint256 exchangeRate) external;
+
+  /* function supply(uint256 amount) external returns (bool); */
+
+  /* function redeem(uint256 amount, address to) external returns (bool); */
+
+  function balanceOfAvailablePrincipal(address account) external view returns (uint256);
+
+  function balanceOfPrincipal(address account) external view returns (uint256);
+
+  function balanceOfScaled(address account) external view returns (uint256);
+
+  function totalScaledSupply() external view returns (uint256);
+
+  function effectivePrincipal(address user) external view returns (uint256);
+
+  function effectivePrincipalScaled(address user) external view returns (uint256);
+
+  function collateralAddress(address account) external view returns (address);
+}

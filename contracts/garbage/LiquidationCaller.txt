@@ -1,0 +1,301 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+import {PoolStorage} from './PoolStorage.sol';
+import {IPool} from './IPool.sol';
+/* import {PoolLogic} from '../libraries/PoolLogic.sol'; */
+import {ICollateralToken} from '../tokens/ICollateralToken.sol';
+
+import {IDebtToken} from '../tokens/IDebtToken.sol';
+
+import {ILiquidationCaller} from './ILiquidationCaller.sol';
+import {IPoolAssetData} from './IPoolAssetData.sol';
+import {IPriceConsumerV3} from '../oracles/IPriceConsumerV3.sol';
+
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+/* import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol"; */
+
+
+
+import "hardhat/console.sol";
+
+contract LiquidationCaller is ILiquidationCaller {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+
+  IPoolAddressesProvider public _addressesProvider;
+  IPoolAssetData private _poolAssetData;
+  IPool private _pool;
+
+  constructor(address provider) {
+      _addressesProvider = IPoolAddressesProvider(provider);
+      _pool = IPool(_addressesProvider.getPool());
+      _poolAssetData = IPoolAssetData(_addressesProvider.getPoolAssetData());
+  }
+
+  struct liquidationCallParams {
+      address borrower;
+      address _debtAsset;
+      address _collateralAsset;
+  }
+
+  function liquidationCall(
+      address borrower,
+      address caller,
+      PoolStorage.PoolAsset memory debtAsset,
+      PoolStorage.PoolAsset memory collateralAsset,
+      PoolStorage.UserData memory userData,
+      uint256 amount
+  ) external override returns (bool) {
+      liquidationCallParams memory params;
+      params.borrower = borrower;
+
+      console.log("in liquidationCall after validateLiquidationCall",  debtAsset.asset);
+
+      uint256 debtBalance = IERC20(debtAsset.debtWrappedAsset).balanceOf(borrower);
+      console.log("in liquidationCall after debtBalance",  debtAsset.debtWrappedAsset);
+
+      uint256 collateralBalance = IERC20(collateralAsset.collateralAssetWrapped).balanceOf(borrower);
+      console.log("in liquidationCall after collateralBalance",  collateralAsset.collateralAssetWrapped);
+
+      if (amount > debtBalance) {
+          amount = debtBalance;
+      }
+
+      (
+          uint256 debtInEth,
+          uint256 debtRepayInEth,
+          uint256 collateralInEth
+      ) = _valueInEth(
+          debtAsset,
+          collateralAsset,
+          debtBalance,
+          amount,
+          collateralBalance,
+          _addressesProvider.getPriceOracle()
+      );
+
+      console.log("in liquidationCall after _valueInEth" );
+
+      uint256 receiverAmount = _calculateReceiveAmount(
+          borrower,
+          debtAsset,
+          collateralAsset,
+          userData,
+          debtInEth,
+          debtRepayInEth,
+          collateralInEth,
+          _addressesProvider.getPriceOracle()
+      );
+      console.log("in liquidationCall after _calculateReceiveAmount", receiverAmount );
+
+      // burn and redeem
+      ICollateralToken(collateralAsset.collateralAssetWrapped).burn(params.borrower, caller, receiverAmount, collateralAsset.collateralExchangeRate);
+      IDebtToken(debtAsset.debtWrappedAsset).burn(params.borrower, amount, debtAsset.borrowExchangeRate);
+
+      // transfer in repay
+      IERC20(debtAsset.asset).safeTransferFrom(caller, debtAsset.wrapped, amount);
+
+      emit LiquidationCall(
+          collateralAsset.asset,
+          debtAsset.asset,
+          amount,
+          receiverAmount
+      );
+
+      return true;
+  }
+
+  struct ValueParams {
+      uint256 debtAssetPrice;
+      uint8 debtAssetPriceDecimals;
+      uint256 debtInEth;
+      uint256 debtRepayInEth;
+      uint256 collateralAssetPrice;
+      uint8 collateralAssetPriceDecimals;
+      uint256 collateralInEth;
+  }
+
+
+
+  function _valueInEth(
+      PoolStorage.PoolAsset memory debtAsset,
+      PoolStorage.PoolAsset memory collateralAsset,
+      uint256 debtBalance,
+      uint256 repayAmount,
+      uint256 collateralBalance,
+      address priceOracle
+  ) internal view returns (
+      uint256,
+      uint256,
+      uint256
+  ) {
+      ValueParams memory params;
+
+      /* PoolStorage.PoolAsset storage debtAsset = poolAssets[_debtAsset];
+      PoolStorage.PoolAsset storage collateralAsset = poolAssets[_collateralAsset]; */
+
+      debtBalance = debtBalance.mul(10**18).div(debtAsset.decimals);
+
+      params.debtAssetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(debtAsset.asset));
+      params.debtAssetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(debtAsset.asset);
+
+      params.debtInEth = debtBalance.mul(params.debtAssetPrice).div(10**uint256(params.debtAssetPriceDecimals));
+
+      repayAmount = repayAmount.mul(10**18).div(debtAsset.decimals);
+
+      params.debtRepayInEth = repayAmount.mul(params.debtAssetPrice).div(10**uint256(params.debtAssetPriceDecimals));
+
+      collateralBalance = collateralBalance.mul(10**18).div(collateralAsset.decimals);
+
+      params.collateralAssetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(collateralAsset.asset));
+      params.collateralAssetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(collateralAsset.asset);
+
+      params.collateralInEth = collateralBalance.mul(params.collateralAssetPrice).div(10**uint256(params.collateralAssetPriceDecimals));
+
+      return (
+          params.debtInEth,
+          params.debtRepayInEth,
+          params.collateralInEth
+      );
+  }
+
+  struct LiquidationParametersParams {
+      uint256 debtInEth;
+      uint256 debtRepayInEth;
+      uint256 collateralInEth;
+      uint256 collateralAssetPrice;
+      uint256 collateralDebtDelta;
+      uint256 liquidationBonusFactorOnSpread;
+      uint256 collateralBonusAmount;
+      uint256 timeRequired;
+      uint256 collateralFromDebtRepayAmount;
+      uint256 collateralBonusToReceiver;
+      uint256 receiverAmount;
+  }
+
+
+  function _calculateReceiveAmount(
+      address account,
+      PoolStorage.PoolAsset memory debtAsset,
+      PoolStorage.PoolAsset memory collateralAsset,
+      PoolStorage.UserData memory userData,
+      uint256 debtInEth,
+      uint256 debtRepayInEth,
+      uint256 collateralInEth,
+      address priceOracle
+  ) internal view returns (
+      uint256
+  ) {
+      LiquidationParametersParams memory params;
+      /* PoolStorage.PoolAsset storage debtAsset = poolAssets[_debtAsset];
+      PoolStorage.PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+      PoolStorage.UserData storage userData = usersData[account]; */
+      params.debtInEth = debtInEth;
+      params.debtRepayInEth = debtRepayInEth;
+      params.collateralInEth = collateralInEth;
+
+      /* liquidationDataParams memory params; */
+      /* params.account = account; */
+      /* params.debtAssetDecimals = debtAsset.decimals; */
+
+      // converting all to 18 decimals to not loose accuracy
+
+      // 120
+      // 130 @ 100%
+      /* params.amount = amount.mul(10**18).div(params.debtAssetDecimals); */
+
+      /* params.debtAssetAddress = debtAsset.asset; */
+      /* params.debtBalance = IERC20(debtAsset.debtWrappedAsset).balanceOf(params.account).mul(10**18).div(params.debtAssetDecimals); */
+
+
+      // 0.92307692307692307692307692307692 = 120/130
+      // 1.0 = 130/130 @ 100%
+      /* uint256 debtRepayRatio = debtRepayInEth.wadDiv(debtInEth); */
+
+
+      /* params.debtAssetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(params.debtAssetAddress));
+      uint8 debtAssetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(params.debtAssetAddress); */
+
+      // debt valuee
+      // used to get delta of debt to collateral
+      // 133.9 = 130 * 1.03
+      /* params.debt = params.debtBalance.mul(params.debtAssetPrice).div(10**uint256(debtAssetPriceDecimals)); */
+
+      // 123.6 = 120 * 1.03
+      // 133.9 = 130 * 1.03 @ 100%
+      /* params.debtRepay = params.amount.mul(params.debtAssetPrice).div(10**uint256(debtAssetPriceDecimals)); */
+
+      /* address collateralAssetAddress = collateralAsset.asset; */
+      params.collateralAssetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(collateralAsset.asset));
+
+      uint8 collateralAssetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(collateralAsset.asset);
+
+      // 118.84615384615384615384615384615 = 1.03 * 120 / 1.04
+      // 133.9 = 1.03 * 130 @ 100%
+      /* uint256 collateralFromDebtAmount = debtInEth.div(params.collateralAssetPrice.div(10**uint256(collateralAssetPriceDecimals))); */
+
+      /* uint256 collateralAssetDecimals = collateralAsset.decimals; */
+
+      /* params.collateralAssetWrapped = collateralAsset.collateralAssetWrapped; */
+      /* uint256 collateralBalance = IERC20(params.collateralAssetWrapped).balanceOf(params.account).mul(10**18).div(params.collateralAssetDecimals); */
+
+      // 145.6 = 1.04 * 140
+      /* uint256 collateral = collateralBalance.mul(params.collateralAssetPrice).div(10**uint256(collateralAssetPriceDecimals)); */
+
+      // available value to be bonusable not inluding max factor
+      // 11.7 = 145.6 - 133.9
+      params.collateralDebtDelta = params.collateralInEth.sub(params.debtInEth);
+
+
+      // liquidationBonusFactorOnSpread = .8
+      // .80
+      params.liquidationBonusFactorOnSpread = collateralAsset.liquidationBonusFactorOnSpread;
+      // available bonus conditional 1
+      // 9.36 = 11.7 * .80
+      params.collateralBonusAmount = params.collateralDebtDelta.wadMul(params.liquidationBonusFactorOnSpread);
+
+      // available bonus conditional 2
+      /* uint256 startTimestamp = userData.startTimestamp; */
+      params.timeRequired = block.timestamp.sub(userData.startTimestamp);
+      if (params.timeRequired > debtAsset.fullLiquidationTimeframe) {
+          // 11.7 = 11.7 * 1.0
+          params.collateralBonusAmount = params.collateralDebtDelta;
+      }
+
+      // 118.84615384615384615384615384615 = 1.03 * 120 / 1.04
+      // 128.75 = 1.03 * 130 / 1.04 @ 100%
+      params.collateralFromDebtRepayAmount = params.debtRepayInEth.div(params.collateralAssetPrice.div(10**uint256(collateralAssetPriceDecimals)));
+      // @ liquidationBonusFactorOnSpread
+      // 8.64 = 9.36 * 0.92307692307692307692307692307692
+      // 9.36 = 9.36 * 1.0 @ 100%
+      // @ full
+      // 10.8 = 11.7 * 0.92307692307692307692307692307692
+      // 11.7 = 11.7 * 1.0 @ 100%
+      params.collateralBonusToReceiver = params.collateralBonusAmount.wadMul(params.debtRepayInEth.wadDiv(params.debtInEth));
+
+      // total collateral value to user is
+      // 127.15384615384615384615384615384 = 118.84615384615384615384615384615 + 8.64 / 1.04
+      // 137.75 = 128.75 + 9.36 / 1.04 @ 100%
+      // @ full
+      // 129.23076923076923076923076923077 = 118.84615384615384615384615384615 + 10.8 / 1.04
+      // 140 = 128.75 + 11.7 / 1.04 @ 100%
+      params.receiverAmount = params.collateralFromDebtRepayAmount.add(params.collateralBonusToReceiver)
+        .div(params.collateralAssetPrice)
+        .mul(10**uint256(collateralAssetPriceDecimals)).mul(collateralAsset.decimals).div(10**18);
+
+      return params.receiverAmount;
+
+
+  }
+
+
+}

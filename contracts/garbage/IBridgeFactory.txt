@@ -1,0 +1,19 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+interface IBridgeFactory {
+
+  event BridgeDeployed(
+      address wrapped,
+      address bridgeAddress
+  );
+
+  function initBridge(
+      address bridgeAddress, // conversionPool
+      address bridgeExchangeRateFeederAddress,
+      address _swapper,
+      address asset,
+      address wrapped
+  ) external returns (address);
+
+}

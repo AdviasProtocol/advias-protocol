@@ -1,0 +1,523 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+import {IPool} from '../pool/IPool.sol';
+
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IPoolAddressesProvider} from '../pool/IPoolAddressesProvider.sol';
+import {ICollateralToken} from './ICollateralToken.sol';
+import {IBridge} from '../anchor/IBridge.sol';
+import {ICollateral} from '../anchor/collateral/ICollateral.sol';
+import {IPoolAssetData} from '../pool/IPoolAssetData.sol';
+
+import '../anchor/collateral/Collateral.sol';
+
+import "hardhat/console.sol";
+
+
+// represents wUST deposited
+// all underlying gets sent to anchor
+contract CollateralToken is ERC20, ICollateralToken {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+  IPoolAddressesProvider public ADDRESSES_PROVIDER;
+  IPoolAssetData private _poolAssetData;
+  IPool private _pool;
+  IBridge private _bridge;
+  address private collateralTokenFactory;
+
+  address private reserve;
+  address private vault;
+
+  /* address internal _treasury; // where reserve factor goes as wrapped token
+  address internal _vault; // where fees go as wrapped token
+  address internal _reserve; // where fees go as wrapped token */
+
+  address internal _underlyingAsset;
+
+  IERC20 private _bridgeWrappedAsset;
+
+  mapping(address => uint256) private _initialExchangeRates;
+
+  mapping(address => address) private _accountCollateralInstances;
+
+  // scaled value used for principal as _collateralPrincipalScaled * _initialExchangeRates
+  // used in LTV formula as debt/_collateralPrincipalScaled
+  // used as a base for bonusFactor redebt as (currentCollateralValue - (_collateralPrincipalScaled * _initialExchangeRates)) * bonus_%
+  mapping(address => uint256) private _collateralPrincipalScaled;
+
+  mapping(address => uint256) private _principalBalance;
+
+
+  uint256 private bridgeTotalSupply; // manually tracked due  to bridge delays
+  string private _name;
+  string private _symbol;
+
+  constructor(
+      address provider,
+      address underlyingAsset
+  ) ERC20("", "") {
+      string memory underlyingAssetName = ERC20(underlyingAsset).name();
+      string memory underlyingAssetSymbol = ERC20(underlyingAsset).symbol();
+
+      string memory name = string(abi.encodePacked("coUST Terra Anchor ", underlyingAssetName));
+      string memory symbol = string(abi.encodePacked("coUST", underlyingAssetSymbol));
+
+
+      ADDRESSES_PROVIDER = IPoolAddressesProvider(provider);
+      _pool = IPool(ADDRESSES_PROVIDER.getPool());
+      _poolAssetData = IPoolAssetData(ADDRESSES_PROVIDER.getPoolAssetData());
+      collateralTokenFactory = ADDRESSES_PROVIDER.getCollateralTokenFactory();
+      _underlyingAsset = underlyingAsset;
+      _name = name;
+      _symbol = symbol;
+      reserve = msg.sender;
+      vault = msg.sender;
+  }
+
+  function initToken(
+      address bridge
+  ) external override {
+
+      _bridge = IBridge(bridge);
+      // save wrapped asset
+      /* address bridgeWrappedAsset = IBridge(bridge)._underlyingWrapped(); */
+      address bridgeWrappedAsset = IBridge(bridge).wrapped();
+
+      _bridgeWrappedAsset = IERC20(bridgeWrappedAsset);
+
+      // save underlying asset
+      /* address bridgeUnderlying = IBridge(bridge)._underlying(); */
+      address bridgeUnderlying = IBridge(bridge).underlying();
+
+      /* require(bridgeUnderlying == _underlyingAsset, "Error: Assets do not match"); */
+
+      // approve
+      IERC20(_underlyingAsset).approve(bridge, ~uint256(0));
+      IERC20(bridgeWrappedAsset).approve(bridge, ~uint256(0));
+
+  }
+
+  modifier onlyPool() {
+    require(msg.sender == address(_pool), "Error: Only pool can be sender.");
+    _;
+  }
+
+  modifier onlyCollateralTokenFactory() {
+    require(msg.sender == collateralTokenFactory, "Error: Only fatory can be sender.");
+    _;
+  }
+
+  /* function mint(address account, uint256 amount, uint256 exchangeRate) external override onlyPool returns (uint256) {
+      uint256 currentTimestamp = block.timestamp;
+
+      uint256 amountBack = _bridge.deposit(
+          amount,
+          0,
+          address(this)
+      );
+
+      require(amountBack > 0, "Error: Bridge failed.  Pleasee try again later");
+
+      //uint256 scaledAmount = amount.wadDiv(exchangeRate);
+      uint256 scaledAmount = amountBack.wadDiv(exchangeRate);
+
+      _initialExchangeRates[account] = exchangeRate;
+
+      //_allocationBalances[asset][account] += scaledAmount;
+
+      _mint(account, scaledAmount);
+      //emit Mint(account, amount, exchangeRate);
+
+      return amountBack;
+  } */
+
+  function mint(address account, uint256 amount, uint256 exchangeRate) external override onlyPool returns (uint256) {
+      uint256 currentTimestamp = block.timestamp;
+
+      address collateralAddress = _accountCollateralInstances[account];
+      console.log("mint Collateral collateralAddress", collateralAddress);
+
+      if (collateralAddress == address(0)) {
+          console.log("mint Collateral instance", collateralAddress);
+
+          Collateral collateralInstance = new Collateral(
+              account,
+              address(_bridge),
+              _underlyingAsset,
+              address(_bridgeWrappedAsset),
+              vault
+          );
+          IERC20(_underlyingAsset).approve(address(collateralInstance), ~uint256(0));
+          console.log("mint Collateral instance1", address(collateralInstance));
+
+          _accountCollateralInstances[account] = address(collateralInstance);
+          collateralAddress = address(collateralInstance);
+      }
+
+      IERC20(_underlyingAsset).transfer(collateralAddress, amount);
+
+      uint256 amountBack = ICollateral(collateralAddress).supply(
+          amount
+      );
+
+      uint256 scaledAmount = amountBack.wadDiv(exchangeRate);
+
+      _initialExchangeRates[account] = exchangeRate;
+
+      _mint(account, scaledAmount);
+
+      return amountBack;
+  }
+
+  struct mintParams {
+    address account;
+  }
+  function mint(address account, uint256 amount, uint256 exchangeRate, uint256 bonusFactor) external override onlyPool returns (uint256) {
+      mintParams memory params;
+      params.account = account;
+      uint256 currentTimestamp = block.timestamp;
+
+      address collateralAddress = _accountCollateralInstances[params.account];
+      /* console.log("mint Collateral collateralAddress", collateralAddress); */
+
+      if (collateralAddress == address(0)) {
+          /* console.log("mint Collateral instance", collateralAddress); */
+
+          Collateral collateralInstance = new Collateral(
+              params.account,
+              address(_bridge),
+              _underlyingAsset,
+              address(_bridgeWrappedAsset),
+              vault
+          );
+          IERC20(_underlyingAsset).approve(address(collateralInstance), ~uint256(0));
+          console.log("mint Collateral instance1", address(collateralInstance));
+
+          _accountCollateralInstances[params.account] = address(collateralInstance);
+          collateralAddress = address(collateralInstance);
+      }
+
+      IERC20(_underlyingAsset).transfer(collateralAddress, amount);
+
+      uint256 amountBack = ICollateral(collateralAddress).supply(
+          amount
+      );
+      /* console.log("collateral tokeen amountBack", amountBack); */
+
+      uint256 scaledAmount = amountBack.wadDiv(exchangeRate);
+
+      // bonusFactor == how much of appreciation borrower is using towards this new borrow
+      // bonusFactor will be 0 for new borrows
+      if (_collateralPrincipalScaled[params.account] != 0) {
+          // ============ V1
+          console.log("in _collateralPrincipalScaled");
+          // new borrow is 1000
+          // collateralBonusExchangeRateFactor = currentER - ((currentER - initialER)*.05)
+          // with a bonusFactor
+          // 1.105 = 1.1 + ((1.2 - 1.1) * .05)
+          // ===
+          // w/o a bonusFactor
+          // 1.1 = 1.1 + ((1.2 - 1.1) * 0)
+          console.log("in _collateralPrincipalScaled bonusFactor", bonusFactor);
+
+          uint256 collateralBonusExchangeRateFactor = _initialExchangeRates[params.account].add((exchangeRate.sub(_initialExchangeRates[params.account])).wadMul(bonusFactor));
+          console.log("in _collateralPrincipalScaled collateralBonusExchangeRateFactor", collateralBonusExchangeRateFactor);
+
+          // value able to be used as collateral against borrows to calculate from
+          // principal = _collateralPrincipalScaled[account] * collateralBonusExchangeRateFactor
+          // 1004.5454545454545454545454545455 = 909.09090909090909090909090909091 * 1.105
+          // ===
+          // w/o a bonusFactor
+          // 1000 = 909.09090909090909090909090909091 * 1.1
+          uint256 collateralBonusAvailable = _collateralPrincipalScaled[params.account].wadMul(collateralBonusExchangeRateFactor);
+          console.log("in _collateralPrincipalScaled collateralBonusAvailable", collateralBonusAvailable);
+
+          // for reborrows
+          // 1670.4545454545454545454545454546 = (1000+1004.5454545454545454545454545455) / 1.2
+          // ===
+          // w/o a bonusFactor
+          // 1666.6666666666666666666666666667 = (1000+1000) / 1.2
+          _collateralPrincipalScaled[params.account] = (amountBack.add(collateralBonusAvailable)).wadDiv(exchangeRate);
+          console.log("in _collateralPrincipalScaled _collateralPrincipalScaled[account]", _collateralPrincipalScaled[params.account]);
+
+          // new scaleed principal is now 1670.4545454545454545454545454546
+          // new principal is now 2004.5454545454545454545454545455 = 1670.4545454545454545454545454546 * 1.2
+          // new principal baseline is _collateralPrincipalScaled[account] * exchangeRate
+          // LTV is now debt/p1+p2...
+          // ===
+          // w/o a bonusFactor
+          // new scaleed principal is now 1666.6666666666666666666666666667
+          // new principal is now 2000 = 1666.6666666666666666666666666667 * 1.2
+
+
+          // ======== V2
+
+
+
+      } else {
+          // ============ V1
+          // new borrows use principal
+          _collateralPrincipalScaled[params.account] = scaledAmount;
+      }
+
+      _initialExchangeRates[params.account] = exchangeRate;
+
+      uint256 totalCollateral = balanceOfScaled(params.account).wadMul(exchangeRate);
+      uint256 collateralInterest = totalCollateral.sub(_principalBalance[params.account]);
+      uint256 bonusAmount = collateralInterest.wadMul(bonusFactor);
+      _principalBalance[params.account] = _principalBalance[params.account].add(amountBack).add(bonusAmount);
+
+      _mint(account, scaledAmount);
+
+      return amountBack;
+  }
+
+  /* function deposit(address account, uint256 amount, uint256 bonusFactor) external override onlyPool returns (uint256) {
+      uint256 currentTimestamp = block.timestamp;
+
+      address collateralAddress = _accountCollateralInstances[account];
+      console.log("mint Collateral collateralAddress", collateralAddress);
+
+      if (collateralAddress == address(0)) {
+          console.log("mint Collateral instance", collateralAddress);
+
+          Collateral collateralInstance = new Collateral(
+              account,
+              address(_bridge),
+              _underlyingAsset,
+              address(_bridgeWrappedAsset),
+              vault
+          );
+          IERC20(_underlyingAsset).approve(address(collateralInstance), ~uint256(0));
+          _accountCollateralInstances[account] = address(collateralInstance);
+          collateralAddress = address(collateralInstance);
+      }
+
+      IERC20(_underlyingAsset).transfer(collateralAddress, amount);
+
+      uint256 exchangeRate = ICollateral(collateralAddress).supply(
+          amount
+      );
+
+      _initialExchangeRates[account] = exchangeRate;
+
+      _mint(account, scaledAmount);
+
+      return amountBack;
+  } */
+
+
+  function effectivePrincipal(address user) external view override returns (uint256) {
+      /* return _collateralPrincipalScaled[user].wadMul(_initialExchangeRates[user]); */
+      return _principalBalance[user];
+  }
+
+  function effectivePrincipalScaled(address user) external view override returns (uint256) {
+      return _collateralPrincipalScaled[user];
+  }
+
+
+  function mintToReserve(uint256 amount, uint256 exchangeRate) external override onlyPool {
+      if (amount == 0) {
+        return;
+      }
+
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+
+
+      _mint(reserve, scaledAmount);
+      /* emit Mint(account, amount, exchangeRate); */
+  }
+
+  function initBridge(address bridge) external onlyPool {
+      _bridge = IBridge(bridge);
+  }
+
+  function supply(uint256 amount) external override onlyPool returns (bool) {
+      require(_poolAssetData.getLastUpdatedTimestamp(_underlyingAsset) == block.timestamp, "Error: Update first.");
+
+      /* uint256 exchangeRate = _pool.getBridgeExchangeRate(_underlyingAsset);
+      bridgeTotalScaledSupply += amount.wadDiv(exchangeRate);
+
+      uint256 depositsSuppliedExchangeRate = _pool.getDepositsSuppliedExchangeRate(_underlyingAsset);
+      depositsSupplyTotalScaledSupply += amount.wadDiv(depositsSuppliedExchangeRate); */
+
+      uint256 amountBack = _bridge.deposit(
+          amount,
+          0,
+          address(this)
+      );
+      require(amountBack != 0, "Error: Bridge failed.  Please try again later");
+
+      emit BridgeDeposit(
+          amount
+      );
+
+      return true;
+  }
+
+  function redeem(uint256 amount, address to) external override onlyPool returns (bool) {
+      require(_poolAssetData.getLastUpdatedTimestamp(_underlyingAsset) == block.timestamp, "Error: Update first.");
+      uint256 collateralExchangeRate = _poolAssetData.getCollateralExchangeRate(_underlyingAsset);
+      uint256 scaledAmount = amount.wadDiv(collateralExchangeRate);
+
+      require(_bridgeWrappedAsset.balanceOf(address(this)) >= scaledAmount, "Error: Not enough balance for withdraw from Anchor, please wait.");
+
+      uint256 amountBack = _bridge.redeem(
+          amount,
+          to
+      );
+
+      require(amountBack > 0, "Error: Bridge failed.  Please try again later");
+
+      emit BridgeRedeem(
+          to,
+          amount
+      );
+
+      return true;
+
+      /* return result; */
+  }
+
+  function burn(address account, address reciever, uint256 amount, uint256 exchangeRate) external override onlyPool {
+      /* _allocationBalances[asset][account] -= scaledAmount; */
+      uint256 bridgeExchangeRate = _poolAssetData.getBridgeExchangeRate(_underlyingAsset);
+      uint256 redeeemScaledAmount = amount.wadDiv(bridgeExchangeRate);
+
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+
+      uint256 amountBack = _bridge.redeem(
+          redeeemScaledAmount,
+          reciever
+      );
+
+      require(amountBack > 0, "Error: Bridge failed.  Please try again later");
+      _collateralPrincipalScaled[account] = _collateralPrincipalScaled[account].wadMul(exchangeRate);
+      _burn(account, scaledAmount);
+  }
+
+  // redeemFull True `if` borrower debt is 0
+  /* notes: */
+  /* cannot use percentage of useer value because using percentage in users collateral contract may effect other loans */
+  function burn(address account, address reciever, uint256 amount, uint256 exchangeRate, bool redeemFull) external override onlyPool {
+
+      // amount = 500
+      // scaled 490.19607843137254901960784313725 = 50/ 1.02
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+
+      // what percentage of borrowers collateral amount
+      // 1000
+      // this is our assumed value of user funds in UST (adjusted with our formula)
+      /* uint256 totalCollateral = balanceOfScaled(account).wadMul(exchangeRate); // borrower total collateral balance value */
+
+      /* uint256 percentage = 0; */
+      console.log("collateral burn() _collateralPrincipalScaled[account]                          ", _collateralPrincipalScaled[account].wadMul(_initialExchangeRates[account]));
+
+      if (redeemFull) {
+          /* percentage = 1e18; */
+          scaledAmount = balanceOfScaled(account);
+          _collateralPrincipalScaled[account] = 0;
+      } else {
+          _collateralPrincipalScaled[account] = _collateralPrincipalScaled[account].sub(amount.wadDiv(_initialExchangeRates[account]));
+      }
+      console.log("collateral burn() _collateralPrincipalScaled[account] after                    ", _collateralPrincipalScaled[account].wadMul(_initialExchangeRates[account]));
+
+      uint256 totalCollateral = balanceOfScaled(account).wadMul(exchangeRate);
+      uint256 collateralInterest = totalCollateral.sub(_principalBalance[account]);
+      console.log("collateral burn() amount                          ", amount);
+      console.log("collateral burn() totalCollateral                 ", totalCollateral);
+      console.log("collateral burn() collateralInterest              ", collateralInterest);
+
+      console.log("collateral burn() _principalBalance[account]      ", _principalBalance[account]);
+      if (amount > collateralInterest) {
+          _principalBalance[account] = _principalBalance[account].sub(amount.sub(collateralInterest));
+      }
+      console.log("collateral burn() _principalBalance[account] after", _principalBalance[account]);
+
+
+
+      address collateralAddress = _accountCollateralInstances[account];
+      uint256 amountBack = ICollateral(collateralAddress).redeem(
+          redeemFull,
+          amount,
+          totalCollateral,
+          reciever
+      );
+      require(amountBack > 0, "Error: Bridge failed.  Please try again later");
+
+
+
+      _burn(account, scaledAmount);
+  }
+
+  function balanceOfUnderlyingWrapped(address account) external view returns (uint256) {
+      return _bridgeWrappedAsset.balanceOf(_accountCollateralInstances[account]);
+  }
+
+  // only owner
+  function balanceOfUnderlying(address account) external view returns (uint256) {
+      uint256 bridgeExchangeRate = _poolAssetData.getBridgeExchangeRate(_underlyingAsset);
+      return _bridgeWrappedAsset.balanceOf(_accountCollateralInstances[account]).wadMul(bridgeExchangeRate);
+  }
+
+  /* function balanceOfUnderlyingInstance(address account) external view returns (uint256) {
+      uint256 scaledBalance = _bridgeWrappedAsset.balanceOf(_accountCollateralInstances[account]);
+      uint256 principal = scaledBalance.wadMul(_initialExchangeRates[account]);
+      uint256 bridgeExchangeRate = _poolAssetData.getBridgeExchangeRate(_underlyingAsset);
+      // use delta to take 90% factor
+      // using this for now
+      uint256 amountDelta = scaledBalance.wadMul(bridgeExchangeRate).sub(principal);
+      return scaledBalance.wadMul(bridgeExchangeRate);
+  } */
+
+  /* function balanceOfPrincipalUnderlyingInstance(address account) external view returns (uint256) {
+      return scaledBalance.wadMul(_initialExchangeRates[account]);
+  } */
+
+  function balanceOfPrincipal(address account) external view override returns (uint256) {
+      return super.balanceOf(account).wadMul(_initialExchangeRates[account]);
+  }
+
+  function balanceOfScaled(address account) public view override returns (uint256) {
+      return super.balanceOf(account);
+  }
+
+  function balanceOf(address account) public view virtual override returns (uint256) {
+      uint256 scaledAmount = super.balanceOf(account);
+      uint256 collateralExchangeRate = _poolAssetData.simulateCollateralExchangeRate(_underlyingAsset);
+      return scaledAmount.wadMul(collateralExchangeRate);
+  }
+
+  function totalScaledSupply() external view override returns (uint256) {
+      return super.totalSupply();
+  }
+
+  function totalSupply() public view virtual override returns (uint256) {
+      /* address bridgeAddress = _pool.getCollateralBridge(_underlyingAsset);
+      (uint256 exchangeRate, ) = _pool._getCollateralInterestData(bridgeAddress); */
+      uint256 collateralExchangeRate = _poolAssetData.simulateCollateralExchangeRate(_underlyingAsset);
+      return super.totalSupply().wadMul(collateralExchangeRate);
+  }
+
+  // bridging may not be accurately depicted due to off chain events taking place in ddifferent blocks
+  // total amount currently available through aUST
+  function bridgeTotalScaledSupply() external view returns (uint256) {
+      return _bridgeWrappedAsset.balanceOf(address(this)); //aUST
+  }
+
+  function bridgeTotalScaledSupplyStored() external view returns (uint256) {
+      return bridgeTotalSupply; // stored
+  }
+
+
+
+}

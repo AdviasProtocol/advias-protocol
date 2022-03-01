@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+
+/**
+ * Request testnet LINK and ETH here: https://faucets.chain.link/
+ * Find information on LINK Token Contracts and get the latest ETH and LINK faucets here: https://docs.chain.link/docs/link-token-contracts/
+ */
+
+/**
+ * THIS IS AN EXAMPLE CONTRACT WHICH USES HARDCODED VALUES FOR CLARITY.
+ * PLEASE DO NOT USE THIS CODE IN PRODUCTION.
+ */
+contract AnchorData is ChainlinkClient, IExchangeRateFeeder {
+    using Chainlink for Chainlink.Request;
+
+    uint256 public exchangeRate;
+
+    address private oracle;
+    bytes32 private jobId;
+    uint256 private fee;
+
+    function exchangeRateOf(address _token, bool _simulate) external view override returns (uint256) {
+        return exchangeRate;
+    }
+
+    /**
+     * Network: Kovan
+     * Oracle: 0xF405B99ACa8578B9eb989ee2b69D518aaDb90c1F
+     * Job ID: c51694e71fa94217b0f4a71b2a6b565a
+     * Fee: 0.1 LINK
+     * Status: Success
+     */
+    constructor() {
+        setPublicChainlinkToken();
+        oracle = 0xF405B99ACa8578B9eb989ee2b69D518aaDb90c1F;
+        jobId = "c51694e71fa94217b0f4a71b2a6b565a";
+        fee = 0.1 * 10 ** 18; // (Varies by network and job)
+    }
+
+    /**
+     * Create a Chainlink request to retrieve API response, find the target
+     * data, then multiply by 1000000000000000000 (to remove decimal places from data).
+     */
+    function requestER() public returns (bytes32 requestId)
+    {
+        Chainlink.Request memory request = buildChainlinkRequest(jobId, address(this), this.fulfill.selector);
+
+        // Set the URL to perform the GET request on
+        request.add("get", "http://chainterra-env.eba-bsdcysdt.us-west-2.elasticbeanstalk.com/er");
+
+        // Sends the request
+        return sendChainlinkRequestTo(oracle, request, fee);
+    }
+
+    /**
+     * Receive the response in the form of uint256
+     */
+    function fulfill(bytes32 _requestId, uint256 _exchangeRate) public recordChainlinkFulfillment(_requestId)
+    {
+        exchangeRate = _exchangeRate;
+    }
+
+    // function withdrawLink() external {} - Implement a withdraw function to avoid locking your LINK in the contract
+}

@@ -1,0 +1,67 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+
+import '../anchor/Bridge.sol';
+/* import '../anchor/Conversion.sol'; */
+
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+
+import {IBridgeFactory} from './IBridgeFactory.sol';
+/* import "hardhat/console.sol"; */
+
+contract BridgeFactory is Initializable, UUPSUpgradeable, OwnableUpgradeable, IBridgeFactory {
+  IPoolAddressesProvider _provider;
+
+  function initialize(IPoolAddressesProvider provider) public initializer {
+      _provider = provider;
+  }
+
+  function _authorizeUpgrade(address) internal override onlyOwner {}
+
+  /* constructor(IPoolAddressesProvider provider) {
+      _provider = provider;
+  } */
+
+  modifier onlyFactories() {
+      require((msg.sender == _provider.getCollateralTokenFactory()) ||
+        (msg.sender == _provider.getSavingsTokenFactory()), "Errors: Caller not factory in Bridge Factory");
+      _;
+  }
+
+  function initBridge(
+      address bridgeRouterAddress, // conversionPool
+      address bridgeExchangeRateFeederAddress,
+      address _swapper,
+      address asset,
+      address wrapped
+  ) external onlyFactories override returns (address) {
+      address _ust = _provider.getUST();
+      address _aust = _provider.getaUST();
+
+      Bridge bridgeInstance = new Bridge(
+          _provider,
+          bridgeRouterAddress,
+          bridgeExchangeRateFeederAddress,
+          _swapper,
+          _ust,
+          _aust,
+          asset,
+          wrapped
+      );
+
+      address bridgeAddress = address(bridgeInstance);
+
+      return bridgeAddress;
+
+      emit BridgeDeployed(
+          wrapped,
+          bridgeAddress
+      );
+
+  }
+
+}

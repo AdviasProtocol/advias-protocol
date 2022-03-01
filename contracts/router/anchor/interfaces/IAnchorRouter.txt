@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IOperation {
+  enum Type {NEUTRAL, DEPOSIT, REDEEM}
+}
+
+// use for WUST
+
+// for non UST eth assets, use ConversionPool
+interface IAnchorRouter {
+    function init(
+        IOperation.Type _type,
+        address _operator,
+        uint256 _amount,
+        address _swapper,
+        address _swapDest,
+        bool _autoFinish
+    ) external;
+
+    function finish(address _operation) external;
+
+    function depositStable(uint256 _amount) external;
+
+    function depositStable(address _operator, uint256 _amount) external;
+
+    function depositStable(
+        address _operator,
+        uint256 _amount,
+        address _swapper,
+        address _swapDest
+    ) external;
+
+    function initDepositStable(uint256 _amount) external;
+
+    function initDepositStable(
+        uint256 _amount,
+        address _swapper,
+        address _swapDest
+    ) external;
+
+    function finishDepositStable(address _operation) external;
+
+    function redeemStable(uint256 _amount) external;
+
+    function redeemStable(address _operator, uint256 _amount) external;
+
+    function redeemStable(
+        address _operator,
+        uint256 _amount,
+        address _swapper,
+        address _swapDest
+    ) external;
+
+    function initRedeemStable(uint256 _amount) external;
+
+    function initRedeemStable(
+        uint256 _amount,
+        address _swapper,
+        address _swapDest
+    ) external;
+
+    function finishRedeemStable(address _operation) external;
+}

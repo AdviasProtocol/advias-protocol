@@ -1,0 +1,558 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+import {PoolStorage} from './PoolStorage.sol';
+import {IPool} from './IPool.sol';
+import {IPoolAssetData} from './IPoolAssetData.sol';
+import {ICollateralToken} from '../tokens/ICollateralToken.sol';
+import {IDebtToken} from '../tokens/IDebtToken.sol';
+import {ILiquidationCaller} from './ILiquidationCaller.sol';
+import {IPoolAssetData} from './IPoolAssetData.sol';
+import {IPriceConsumerV3} from '../oracles/IPriceConsumerV3.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {PoolLogic} from '../libraries/PoolLogic.sol';
+
+import "hardhat/console.sol";
+
+contract LiquidationCaller is PoolStorage {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+
+  IPoolAddressesProvider public _addressesProvider;
+  IPoolAssetData private _poolAssetData;
+  IPool private _pool;
+
+  constructor(address provider) {
+      _addressesProvider = IPoolAddressesProvider(provider);
+      _pool = IPool(_addressesProvider.getPool());
+      _poolAssetData = IPoolAssetData(_addressesProvider.getPoolAssetData());
+  }
+
+  struct liquidationCallParams {
+      address caller;
+      address borrower;
+      uint256 collateralLiquidationTotalValue;
+      address debtAsset;
+      address debtWrappedAsset;
+      uint256 debt;
+      uint256 debtPrincipal;
+      uint256 minLiquiationAmount;
+      uint256 maxDebtToPayoff;
+      uint256 debtAssetDecimals;
+      uint256 repayDebtValue;
+      uint256 borrowExchangeRate;
+      uint256 collateralValueInEth;
+      uint256 collateralReceiverValue;
+      uint256 collateralBonus;
+  }
+
+  /* function liquidationCall(
+      mapping(address => PoolStorage.PoolAsset) storage poolAssets,
+      mapping(uint256 => address) storage poolAssetsList,
+      uint256 poolAssetsCount,
+      PoolStorage.PoolAsset storage debtAsset,
+      PoolStorage.PoolAsset storage collateralAsset,
+      uint256 repayAmountValueInEth, // up to max amount allowed
+      uint256 collateralAssetAmountValueInEth, // up to max amount allowed
+      uint256 debtAssetAmountValueInEth, // up to max amount allowed
+      address account,
+      address receiver
+  ) private returns (bool) {
+
+      uint256 totalDebtValueInEth;
+      uint256 totalCollateralValueInEth;
+
+      uint256 avgMaxCtdLiquidationThreshold;
+      uint256 avgLiquidationThreshold;
+
+      for (uint256 i = 0; i < poolAssetsCount; i++) {
+          address currentPoolAssetAddress = poolAssetsList[i];
+          PoolStorage.PoolAsset storage currentPoolAsset = poolAssets[currentPoolAssetAddress];
+
+          uint256 debt;
+          if (currentPoolAsset.isDebt){
+              debt = IERC20(currentPoolAsset.debtWrappedAsset).balanceOf(account);
+          }
+
+          uint256 collateral;
+          if (currentPoolAsset.isCollateral){
+              collateral = IERC20(currentPoolAsset.collateralAssetWrapped).balanceOf(account);
+          }
+
+          if (debt == 0 && collateral == 0) {
+              continue;
+          }
+
+          uint256 debtValue = PoolLogic.getValueInEth(
+              currentPoolAssetAddress,
+              currentPoolAsset.decimals,
+              debt,
+              _addressesProvider.getPriceOracle()
+          );
+          totalDebtValueInEth += debtValue;
+
+          // stable liquidation threshold?????
+
+          uint256 collateralValue = PoolLogic.getValueInEth(
+              currentPoolAssetAddress,
+              currentPoolAsset.decimals,
+              collateral,
+              _addressesProvider.getPriceOracle()
+          );
+          totalCollateralValueInEth += collateralValue;
+
+          uint256 maxCtdLiquidationThreshold = currentPoolAsset.maxCtdLiquidationThreshold;
+
+          avgMaxCtdLiquidationThreshold = avgMaxCtdLiquidationThreshold.add(
+              collateralValue.wadDiv(maxCtdLiquidationThreshold)
+          );
+
+          uint256 liquidationThreshold = currentPoolAsset.liquidationThreshold;
+
+          // uint256 liquidationThreshold = currentPoolAsset.isStable ? currentPoolAsset.stableLiquidationThreshold : currentPoolAsset.liquidationThreshold;
+
+          avgLiquidationThreshold = avgLiquidationThreshold.add(
+              debtValue.mul(liquidationThreshold)
+          );
+
+      }
+
+      avgLiquidationThreshold = avgLiquidationThreshold.div(totalCollateralValueInEth);
+
+      // 1.06 =  254,400 / 240,000
+      uint256 avgMaxCtdLiquidationThresholdSpread = avgMaxCtdLiquidationThreshold.div(totalCollateralValueInEth);
+      // 1.09 = 240,000 / 220,000
+      uint256 currentCtd = totalCollateralValueInEth.div(totalDebtValueInEth);
+      // max collateral scale
+      // .97 = 1.06 / 1.09
+      uint256 collateralHealth = avgMaxCtdLiquidationThresholdSpread.wadDiv(currentCtd);
+
+      uint256 maxRewardValueInEth;
+      if (collateralHealth < 1e18) {
+          require(!collateralAsset.isStable, "Error: Liquidating based on CTD can only happen on stable collateral");
+          // assume a 60% debt repay
+
+          // 79200 = 66000 + (66000 * .2)
+          maxRewardValueInEth = repayAmountValueInEth.add(repayAmountValueInEth.wadMul(debtAsset.liquidationBonusFactor));
+          // 40800 = 120,000 - 79200
+          uint256 remainingCollateralAmountValueInEth = collateralAssetAmountValueInEth.sub(maxRewardValueInEth);
+          // 30800 = 110,000 - 79200
+          uint256 remainingDebtAmountValueInEth = debtAssetAmountValueInEth.sub(maxRewardValueInEth);
+
+          // get ltv and ctd after the above takes place
+
+          // .75 = 30800 / 40800
+          uint256 suedoLtv = remainingDebtAmountValueInEth.div(remainingCollateralAmountValueInEth);
+          // 1.32 = 40800 / 30800
+          uint256 suedoCtv = remainingCollateralAmountValueInEth.div(remainingDebtAmountValueInEth);
+
+          // if 1.11 < 1.00
+          if (suedoCtv < collateralAsset.ctd) {
+
+          }
+      }
+
+      // min collateral scale
+      // .87272 = 240,000 * .8 / 220,000
+      uint256 debtHealth = totalDebtValueInEth == 0 ? ~uint256(0) : (totalCollateralValueInEth.wadMul(avgLiquidationThreshold)).wadDiv(totalDebtValueInEth);
+
+      uint256 collateralToReceiverValueInEth;
+      if (debtHealth < 1e18) {
+          collateralToReceiverValueInEth = repayAmountValueInEth.add(repayAmountValueInEth.wadMul(collateralAsset.liquidationBonusFactor));
+          if (collateralToReceiverValueInEth > collateralAssetAmountValueInEth) {
+              collateralToReceiverValueInEth = collateralAssetAmountValueInEth;
+          }
+      }
+
+
+      return (
+        totalCollateralValueInEth,
+        totalDebtValueInEth,
+        currentCtd,
+        collateralHealth,
+        debtHealth
+      );
+  } */
+
+  /* function liquidationCall(
+      uint256 totalCollateralValueInEth,
+      uint256 totalDebtValueInEth,
+      uint256 averageCtd,
+      uint256 collateralHealth,
+      uint256 debtHealth,
+      PoolStorage.PoolAsset storage debtAsset,
+      PoolStorage.PoolAsset storage collateralAsset,
+      uint256 repayAmount, // up to max amount allowed
+      address account,
+      address receiver,
+      uint256 liquidationBonusFactor,
+      uint256 liquidationFactor,
+      bool isStable,
+      address[] memory debtAssets,
+      uint256[] memory repayAmounts,
+      address[] memory collateralAssets
+
+  ) private returns (bool) {
+
+
+      uint256 collateralAmount = IERC20(collateralAsset).balanceOf(account);
+
+      uint256 collateralValueInEth = PoolLogic.getValueInEth(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          collateralAmount,
+          addressesProvider.getPriceOracle()
+      );
+
+      uint256 repayValueInEth = PoolLogic.getValueInEth(
+          debtAsset.asset,
+          debtAsset.decimals,
+          repayAmount,
+          addressesProvider.getPriceOracle()
+      );
+
+      uint256 debtAmount = IERC20(debtAsset).balanceOf(account);
+
+      uint256 debtValueInEth = PoolLogic.getValueInEth(
+          debtAsset.asset,
+          debtAsset.decimals,
+          debtAmount,
+          addressesProvider.getPriceOracle()
+      );
+
+      uint256[] memory debtValuesInEth;
+      uint256[] memory repayValuesInEth;
+      for (uint256 i = 0; i < debtAssets.length; i++) {
+          uint256 debtAmount = IERC20(debtAssets[i]).balanceOf(account);
+
+          debtValuesInEth[i] = PoolLogic.getValueInEth(
+              debtAssets[i],
+              debtAsset.decimals,
+              debtAmount,
+              addressesProvider.getPriceOracle()
+          );
+
+          repayValuesInEth[i] += PoolLogic.getValueInEth(
+              debtAsset.asset,
+              debtAsset.decimals,
+              repayAmount,
+              addressesProvider.getPriceOracle()
+          );
+
+          if (repayValuesInEth[i] > debtValuesInEth[i]) {
+                repayValueInEth = repayValuesInEth;
+          }
+
+      }
+
+
+
+
+
+
+
+
+
+      if (collateralHealth > 1e18) {
+          if (repayValueInEth > debtValueInEth) {
+
+          }
+
+      } else if (debtHealth > 1e18) {
+          if (repayValueInEth > debtValueInEth) {
+
+          }
+
+
+      }
+
+      if (collateralHealth > 1e18) {
+          maxRewardValueInEth = repayValueInEth.wadMul(averageCtd);
+      } else if (debtHealth > 1e18) {
+          maxRepayValueInEth = repayValueInEth.wadMul(liquidationBonusFactor);
+      }
+
+      if (maxRewardValueInEth > collateralValueInEth) {
+          maxRewardValueInEth = collateralValueInEth;
+      }
+
+
+      PoolLogic.validateLiquidationCall(
+          collateralAsset,
+          debtAsset,
+          collateralHealth,
+          debtHealth,
+          borrower
+      );
+
+
+
+
+
+
+
+
+      // 1.06 =  254,400 / 240,000
+      uint256 avgMaxCtdLiquidationThresholdSpread = avgMaxCtdLiquidationThreshold.div(totalCollateralValueInEth);
+      // 1.09 = 240,000 / 220,000
+      uint256 currentCtd = totalCollateralValueInEth.div(totalDebtValueInEth);
+      // max collateral scale
+      // .97 = 1.06 / 1.09
+      uint256 collateralHealth = avgMaxCtdLiquidationThresholdSpread.wadDiv(currentCtd);
+
+      uint256 maxRewardValueInEth;
+      if (collateralHealth < 1e18) {
+          require(!isStable, "Error: Liquidating based on CTD can only happen on stable collateral");
+          // assume a 60% debt repay
+
+
+
+
+
+          // 79200 = 66000 + (66000 * .2)
+          maxRewardValueInEth = repayAmountValueInEth.add(repayAmountValueInEth.wadMul(liquidationBonusFactor));
+          // 40800 = 120,000 - 79200
+          uint256 remainingCollateralAmountValueInEth = collateralAssetAmountValueInEth.sub(maxRewardValueInEth);
+          // 30800 = 110,000 - 79200
+          uint256 remainingDebtAmountValueInEth = debtAssetAmountValueInEth.sub(maxRewardValueInEth);
+
+          // get ltv and ctd after the above takes place
+
+          // .75 = 30800 / 40800
+          uint256 suedoLtv = remainingDebtAmountValueInEth.div(remainingCollateralAmountValueInEth);
+          // 1.32 = 40800 / 30800
+          uint256 suedoCtv = remainingCollateralAmountValueInEth.div(remainingDebtAmountValueInEth);
+
+          // if 1.11 < 1.00
+          if (suedoCtv < collateralAsset.ctd) {
+
+          }
+      }
+
+      // min collateral scale
+      // .87272 = 240,000 * .8 / 220,000
+      uint256 debtHealth = totalDebtValueInEth == 0 ? ~uint256(0) : (totalCollateralValueInEth.wadMul(avgLiquidationThreshold)).wadDiv(totalDebtValueInEth);
+
+      uint256 collateralToReceiverValueInEth;
+      if (debtHealth < 1e18) {
+          collateralToReceiverValueInEth = repayAmountValueInEth.add(repayAmountValueInEth.wadMul(collateralAsset.liquidationBonusFactor));
+          if (collateralToReceiverValueInEth > collateralAssetAmountValueInEth) {
+              collateralToReceiverValueInEth = collateralAssetAmountValueInEth;
+          }
+      }
+
+  } */
+
+  function liquidationCallOnCtd(
+      uint256 averageCtd,
+      address borrower,
+      address receiver,
+      uint256 liquidationBonusFactor,
+      address[] memory debtAssets,
+      address[] memory debtAssetAvaTokens,
+      uint256[] memory debtAssetDecimals,
+      uint256[] memory repayAmounts,
+      address[] memory collateralAssets,
+      address[] memory collateralAssetAvaTokens,
+      uint256[] memory collateralAssetDecimals
+  ) private returns (bool) {
+
+
+
+      uint256[] memory debtValuesInEth;
+      uint256[] memory repayValuesInEth;
+      uint256 totalRepayValueInEth;
+      for (uint256 i = 0; i < repayAmounts.length; i++) {
+          uint256 debtAmount = IERC20(debtAssetAvaTokens[i]).balanceOf(borrower);
+
+          debtValuesInEth[i] = PoolLogic.getValueInEth(
+              debtAssets[i],
+              debtAssetDecimals[i],
+              debtAmount,
+              addressesProvider.getPriceOracle()
+          );
+
+          repayValuesInEth[i] += PoolLogic.getValueInEth(
+              debtAssets[i],
+              debtAssetDecimals[i],
+              repayAmounts[i],
+              addressesProvider.getPriceOracle()
+          );
+
+          if (repayValuesInEth[i] > debtValuesInEth[i]) {
+              repayValuesInEth[i] = debtValuesInEth[i];
+          }
+
+          totalRepayValueInEth += repayValuesInEth[i];
+
+      }
+
+      uint256 totalRepayValueInEthPlusBonus = totalRepayValueInEth.wadMul(averageCtd);
+
+      /* uint256[] memory collateralLiquidationValuesInEth; */
+      uint256 remainingValueInEthToLiquidate = totalRepayValueInEthPlusBonus;
+
+      for (uint256 i = 0; i < collateralAssets.length; i++) {
+          /* require(!isStable, "Error: Liquidating based on CTD can only happen on stable collateral"); */
+          bool isStable = _poolAssetData.getIsStable(collateralAssets[i]);
+          if (
+            remainingValueInEthToLiquidate == 0 ||
+            !isStable
+          ) {
+              continue;
+          }
+
+          uint256 collateralAmount = IERC20(collateralAssetAvaTokens[i]).balanceOf(borrower);
+
+          uint256 collateralValueInEth = PoolLogic.getValueInEth(
+              collateralAssets[i],
+              collateralAssetDecimals[i],
+              collateralAmount,
+              addressesProvider.getPriceOracle()
+          );
+
+          uint256 valueInEthToLiquidate = remainingValueInEthToLiquidate;
+          if (collateralValueInEth < remainingValueInEthToLiquidate) {
+              valueInEthToLiquidate = collateralValueInEth;
+          }
+
+          uint256 collateralBurnAmount = PoolLogic.getAmountFromValueInEth(
+              collateralAssets[i],
+              collateralAssetDecimals[i],
+              valueInEthToLiquidate,
+              addressesProvider.getPriceOracle()
+          );
+
+          uint256 collateralExchangeRate = _poolAssetData.getCollateralExchangeRate(collateralAssets[i]);
+          ICollateralToken(collateralAssetAvaTokens[i]).burnAndRedeem(
+              borrower,
+              receiver,
+              collateralBurnAmount,
+              collateralExchangeRate
+          );
+
+          remainingValueInEthToLiquidate -= valueInEthToLiquidate;
+
+      }
+
+      // repayUnmetValueInEth The amount to remove from safeTransferFrom
+      // if there are multiple debt and collateral positions but liquidator
+      // includes collateral positions too few in value to meet liquidation amount
+      // theen remove the difference from the repay transfer in
+      uint256 repayUnmetValueInEth;
+      if (remainingValueInEthToLiquidate < totalRepayValueInEthPlusBonus) {
+          repayUnmetValueInEth = totalRepayValueInEthPlusBonus.sub(remainingValueInEthToLiquidate);
+      }
+
+
+      uint256 remainingRepayUnmetValueInEth = repayUnmetValueInEth;
+      for (uint256 i = 0; i < repayValuesInEth.length; i++) {
+          if (remainingRepayUnmetValueInEth > repayValuesInEth[i]) {
+              remainingRepayUnmetValueInEth -= repayValuesInEth[i];
+              continue; // /////// skip
+          }
+          uint256 repayValueInEthToTransfer = repayValuesInEth[i].sub(remainingRepayUnmetValueInEth);
+          uint256 repayAmount = PoolLogic.getAmountFromValueInEth(
+              debtAssets[i],
+              debtAssetDecimals[i],
+              repayValueInEthToTransfer,
+              addressesProvider.getPriceOracle()
+          );
+
+          IERC20(debtAssets[i]).safeTransferFrom(receiver, debtAssetAvaTokens[i], repayAmount);
+      }
+
+
+
+
+  }
+
+  function calculateHealth(
+      uint256 totalCollateral,
+      uint256 totalDebt,
+      uint256 avgLiquidationThreshold
+  ) internal pure returns (uint256) {
+      if (totalDebt == 0) return ~uint256(0);
+      return (totalCollateral.wadMul(avgLiquidationThreshold)).wadDiv(totalDebt);
+  }
+
+
+  /* function liquidationCall(
+      address debtAsset,
+      address collateralAsset,
+      uint256 repayAmount,
+      address account,
+      address receiver
+  ) external returns (bool) {
+
+      address[] memory poolAssetsList = _poolAssetData.getPoolAssetsList();
+
+      uint256 totalDebtValueInEth;
+      uint256 totalCollateralValueInEth;
+
+      uint256 avgMaxCtdLiquidationThreshold;
+      uint256 avgLiquidationThreshold;
+
+      for (uint256 i = 0; i < poolAssetsList.length; i++) {
+          address currentPoolAssetAddress = poolAssetsList[i];
+
+          uint256 debt;
+          if (_poolAssetData.getIsDebt(currentPoolAssetAddress)){
+              debt = IERC20(_poolAssetData.getDebtWrappedAsset(currentPoolAssetAddress)).balanceOf(account);
+          }
+
+          uint256 collateral;
+          if (_poolAssetData.getIsCollateral(currentPoolAssetAddress)){
+              collateral = IERC20(_poolAssetData.getCollateralWrappedAsset(currentPoolAssetAddress)).balanceOf(account);
+          }
+
+          if (debt == 0 && collateral == 0) {
+              continue;
+          }
+
+          uint256 decimals = _poolAssetData.getDecimals(currentPoolAssetAddress);
+          uint256 debtValue = PoolLogic.getValueInEth(
+              currentPoolAssetAddress,
+              decimals,
+              debt,
+              _addressesProvider.getPriceOracle()
+          );
+          totalDebtValueInEth += debtValue;
+
+          // stable liquidation threshold?????
+
+          uint256 collateralValue = PoolLogic.getValueInEth(
+              currentPoolAssetAddress,
+              decimals,
+              collateral,
+              _addressesProvider.getPriceOracle()
+          );
+          totalCollateralValueInEth += collateralValue;
+
+          uint256 maxCtdLiquidationThreshold = _poolAssetData.getMaxCtdLiquidationThreshold(currentPoolAssetAddress);
+
+          avgMaxCtdLiquidationThreshold = avgMaxCtdLiquidationThreshold.add(
+              collateralValue.wadDiv(maxCtdLiquidationThreshold)
+          );
+
+          uint256 liquidationThreshold = _poolAssetData.getLiquidationThreshold(currentPoolAssetAddress);
+
+          avgLiquidationThreshold = avgLiquidationThreshold.add(
+              debtValue.mul(liquidationThreshold)
+          );
+
+      }
+
+      avgLiquidationThreshold = avgLiquidationThreshold.div(totalCollateralValueInEth);
+
+      avgMaxCtdLiquidationThreshold = avgMaxCtdLiquidationThreshold.div(totalDebtValueInEth);
+  } */
+
+
+}

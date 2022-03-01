@@ -1,0 +1,450 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+import {PoolStorage} from './PoolStorage.sol';
+import {IPool} from './IPool.sol';
+import {IPoolAssetData} from './IPoolAssetData.sol';
+import {ICollateralToken} from '../tokens/ICollateralToken.sol';
+import {IDebtToken} from '../tokens/IDebtToken.sol';
+import {ILiquidationCaller} from './ILiquidationCaller.sol';
+import {IPoolAssetData} from './IPoolAssetData.sol';
+import {IPriceConsumerV3} from '../oracles/IPriceConsumerV3.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+import "hardhat/console.sol";
+
+contract LiquidationCaller is ILiquidationCaller {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+
+  IPoolAddressesProvider public _addressesProvider;
+  IPoolAssetData private _poolAssetData;
+  IPool private _pool;
+
+  constructor(address provider) {
+      _addressesProvider = IPoolAddressesProvider(provider);
+      _pool = IPool(_addressesProvider.getPool());
+      _poolAssetData = IPoolAssetData(_addressesProvider.getPoolAssetData());
+  }
+
+  struct liquidationCallParams {
+      address caller;
+      address borrower;
+      uint256 collateralLiquidationTotalValue;
+      address debtAsset;
+      address debtWrappedAsset;
+      uint256 debt;
+      uint256 debtPrincipal;
+      uint256 minLiquiationAmount;
+      uint256 maxDebtToPayoff;
+      uint256 debtAssetDecimals;
+      uint256 repayDebtValue;
+      uint256 borrowExchangeRate;
+      uint256 collateralValueInEth;
+      uint256 collateralReceiverValue;
+      uint256 collateralBonus;
+  }
+
+  function liquidationCallMulti(
+      address borrower,
+      address caller,
+      PoolStorage.PoolAsset memory collateralAsset,
+      address[] memory debtAssets,
+      uint256[] memory amounts
+  ) external override returns (bool) {
+      liquidationCallParams memory params;
+      params.borrower = borrower;
+
+      uint256 currentTimestamp = block.timestamp;
+
+      uint256 collateral = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAndPrincipal(params.borrower);
+      uint256 liquidationBonusFactor = collateralAsset.liquidationBonusFactor;
+
+      for (uint256 i = 0; i < debtAssets.length; i++) {
+          uint256 maxDebtLiquidationFactor = 1;
+          uint256 lastAmortizationTimestamp = 1;
+          uint256 minDebtThresholdValue = 1; // 4000 usd
+          uint256 maxAmortizationTime = 1; // 4000 usd
+          if (currentTimestamp.sub(lastAmortizationTimestamp) < maxAmortizationTime) {
+              continue;
+          }
+
+          params.debtWrappedAsset = IPoolAssetData(_addressesProvider.getPoolAssetData()).getDebtWrappedAsset(debtAssets[i]);
+
+          params.debt = IERC20(params.debtWrappedAsset).balanceOf(params.borrower);
+          params.debtPrincipal = IDebtToken(params.debtWrappedAsset).balanceOfPrincipal(params.borrower);
+
+
+          params.minLiquiationAmount = params.debt.sub(params.debtPrincipal); // min liquidation amount
+          params.maxDebtToPayoff = params.debtPrincipal.wadMul(maxDebtLiquidationFactor).add(params.minLiquiationAmount); // 20% of principal + debt amortization
+
+          // if cacn liquidatt 100% of debt
+          if (
+            params.debtPrincipal < minDebtThresholdValue
+          ) {
+              params.maxDebtToPayoff = params.debt;
+          }
+
+          if (
+            amounts[i] > params.maxDebtToPayoff
+          ) {
+              amounts[i] = params.maxDebtToPayoff;
+          }
+
+          // amount must be greater than or equail to minLiquiationAmount  if over minDebtThresholdValue
+          if (
+            amounts[i] < params.minLiquiationAmount
+          ) {
+              revert("Error: Amount not enough");
+          }
+
+          params.debtAssetDecimals = IPoolAssetData(_addressesProvider.getPoolAssetData()).getDecimals(debtAssets[i]);
+
+          params.repayDebtValue = _valueInEth(
+              debtAssets[i],
+              params.debtAssetDecimals,
+              amounts[i],
+              _addressesProvider.getPriceOracle()
+          );
+
+          params.collateralLiquidationTotalValue += params.repayDebtValue.add(params.repayDebtValue.wadMul(liquidationBonusFactor));
+
+          // transfer in repay
+          // make sure to approve each debt ass repay amount
+          params.borrowExchangeRate = IPoolAssetData(_addressesProvider.getPoolAssetData()).getBorrowExchangeRate(debtAssets[i]);
+          IERC20(debtAssets[i]).safeTransferFrom(caller, params.debtWrappedAsset, amounts[i]);
+          IDebtToken(params.debtWrappedAsset).burn(params.borrower, amounts[i], params.borrowExchangeRate);
+      }
+      require(params.collateralLiquidationTotalValue > 0, "Error: Liquidation bonus is zero");
+
+      params.collateralValueInEth = _valueInEth(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          collateral,
+          _addressesProvider.getPriceOracle()
+      );
+
+      params.collateralReceiverValue = params.collateralLiquidationTotalValue >= params.collateralValueInEth ? params.collateralLiquidationTotalValue : params.collateralValueInEth;
+
+      params.collateralBonus = _amountFromEthValue(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          params.collateralReceiverValue,
+          _addressesProvider.getPriceOracle()
+      );
+
+      // burn and redeem
+      /* ICollateralToken(collateralAsset.collateralAssetWrapped).burn(params.borrower, caller, params.collateralBonus, collateralAsset.collateralExchangeRate); */
+
+      /* emit LiquidationCall(
+          collateralAsset.asset,
+          debtAsset.asset,
+          0,
+          params.collateralBonus
+      ); */
+
+      return true;
+
+  }
+
+  function liquidationCall(
+      address borrower,
+      address caller,
+      PoolStorage.PoolAsset memory collateralAsset,
+      address debtAsset,
+      uint256 amount
+  ) external override returns (bool) {
+      liquidationCallParams memory params;
+      params.borrower = borrower;
+
+      uint256 collateral = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAndPrincipal(params.borrower);
+      uint256 liquidationBonusFactor = collateralAsset.liquidationBonusFactor;
+
+      uint256 maxDebtLiquidationFactor = 1;
+      /* uint256 lastAmortizationTimestamp = 1; */
+      uint256 minDebtThresholdValue = 1; // 4000 usd
+
+      params.debtWrappedAsset = IPoolAssetData(_addressesProvider.getPoolAssetData()).getDebtWrappedAsset(debtAsset);
+
+      params.debt = IERC20(params.debtWrappedAsset).balanceOf(params.borrower);
+      params.debtPrincipal = IDebtToken(params.debtWrappedAsset).balanceOfPrincipal(params.borrower);
+
+
+      params.minLiquiationAmount = params.debt.sub(params.debtPrincipal); // min liquidation amount
+      params.maxDebtToPayoff = params.debtPrincipal.wadMul(maxDebtLiquidationFactor).add(params.minLiquiationAmount); // 20% of principal + debt amortization
+
+      // if cacn liquidatt 100% of debt
+      if (
+        params.debtPrincipal < minDebtThresholdValue
+      ) {
+          params.maxDebtToPayoff = params.debt;
+      }
+
+      if (
+        amount > params.maxDebtToPayoff
+      ) {
+          amount = params.maxDebtToPayoff;
+      }
+
+      // amount must be greater than or equail to minLiquiationAmount  if over minDebtThresholdValue
+      if (
+        amount < params.minLiquiationAmount
+      ) {
+          revert("Error: Amount not enough");
+      }
+
+      params.debtAssetDecimals = IPoolAssetData(_addressesProvider.getPoolAssetData()).getDecimals(debtAsset);
+
+      params.repayDebtValue = _valueInEth(
+          debtAsset,
+          params.debtAssetDecimals,
+          amount,
+          _addressesProvider.getPriceOracle()
+      );
+
+      params.collateralLiquidationTotalValue = params.repayDebtValue.add(params.repayDebtValue.wadMul(liquidationBonusFactor));
+
+      // transfer in repay
+      // make sure to approve each debt ass repay amount
+      params.borrowExchangeRate = IPoolAssetData(_addressesProvider.getPoolAssetData()).getBorrowExchangeRate(debtAsset);
+      IERC20(debtAsset).safeTransferFrom(caller, params.debtWrappedAsset, amount);
+      IDebtToken(params.debtWrappedAsset).burn(params.borrower, amount, params.borrowExchangeRate);
+
+      require(params.collateralLiquidationTotalValue > 0, "Error: Liquidation bonus is zero");
+
+      params.collateralValueInEth = _valueInEth(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          collateral,
+          _addressesProvider.getPriceOracle()
+      );
+
+      params.collateralReceiverValue = params.collateralLiquidationTotalValue >= params.collateralValueInEth ? params.collateralLiquidationTotalValue : params.collateralValueInEth;
+
+      params.collateralBonus = _amountFromEthValue(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          params.collateralReceiverValue,
+          _addressesProvider.getPriceOracle()
+      );
+
+      // burn and redeem
+      /* ICollateralToken(collateralAsset.collateralAssetWrapped).burn(params.borrower, caller, params.collateralBonus, collateralAsset.collateralExchangeRate); */
+
+      /* emit LiquidationCall(
+          collateralAsset.asset,
+          debtAsset.asset,
+          0,
+          params.collateralBonus
+      ); */
+
+      return true;
+
+  }
+
+
+  /* function liquidationCallV2(
+      LiquidationCallStructParams calldata params
+  ) public override returns (bool) {
+
+
+      uint256 collateral = ICollateralToken(params.collateralAssetWrapped).balanceOfAndPrincipal(params.borrower);
+
+      uint256 debt = IERC20(params.debtWrappedAsset).balanceOf(params.borrower);
+      uint256 debtPrincipal = IDebtToken(params.debtWrappedAsset).balanceOfPrincipal(params.borrower);
+
+
+      uint256 minLiquiationAmount = debt.sub(debtPrincipal); // min liquidation amount
+      uint256 maxDebtToPayoff = debtPrincipal.wadMul(params.maxDebtLiquidationFactor).add(minLiquiationAmount); // 20% of principal + debt amortization
+
+      // if cacn liquidatt 100% of debt
+      if (
+        debtPrincipal < params.minDebtThresholdValue
+      ) {
+          maxDebtToPayoff = debt;
+      }
+      if (
+        params.amount > maxDebtToPayoff
+      ) {
+          params.amount = maxDebtToPayoff;
+      }
+
+      // amount must be greater than or equail to minLiquiationAmount  if over minDebtThresholdValue
+      if (
+        params.amount < minLiquiationAmount
+      ) {
+          revert("Error: Amount not enough");
+      }
+
+      uint256 debtAssetDecimals = IPoolAssetData(_addressesProvider.getPoolAssetData()).getDecimals(params._debtAsset);
+
+      uint256 repayDebtValue = _valueInEth(
+          params._debtAsset,
+          debtAssetDecimals,
+          params.amount,
+          _addressesProvider.getPriceOracle()
+      );
+
+      uint256 collateralLiquidationTotalValue = repayDebtValue.add(repayDebtValue.wadMul(params.liquidationBonusFactor));
+
+      // transfer in repay
+      // make sure to approve each debt ass repay amount
+      uint256 borrowExchangeRate = IPoolAssetData(_addressesProvider.getPoolAssetData()).getBorrowExchangeRate(params._debtAsset);
+      IERC20(params._debtAsset).safeTransferFrom(params.caller, params.debtWrappedAsset, params.amount);
+      IDebtToken(params.debtWrappedAsset).burn(params.borrower, params.amount, borrowExchangeRate);
+
+      require(collateralLiquidationTotalValue > 0, "Error: Liquidation bonus is zero");
+
+      uint256 collateralValueInEth = _valueInEth(
+          params._collateralAsset,
+          params.collateralDecimals,
+          collateral,
+          _addressesProvider.getPriceOracle()
+      );
+
+      uint256 collateralReceiverValue = collateralLiquidationTotalValue >= collateralValueInEth ? collateralLiquidationTotalValue : collateralValueInEth;
+
+      uint256 collateralBonus = _amountFromEthValue(
+          params._collateralAsset,
+          params.collateralDecimals,
+          collateralReceiverValue,
+          _addressesProvider.getPriceOracle()
+      );
+
+      // burn and redeem
+      ICollateralToken(params.collateralAssetWrapped).burn(params.borrower, params.caller, collateralBonus, params.collateralAssetExchangeRate);
+
+      return true;
+
+  } */
+
+  /* function liquidationCall(
+      address borrower,
+      address caller,
+      PoolStorage.PoolAsset memory debtAsset,
+      PoolStorage.PoolAsset memory collateralAsset,
+      uint256 amount
+  ) external override returns (bool) {
+      liquidationCallParams memory params;
+      params.borrower = borrower;
+      params.caller = caller;
+
+      uint256 now = block.timestamp;
+
+      uint256 collateral = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAndPrincipal(params.borrower);
+      uint256 liquidationBonusFactor = collateralAsset.liquidationBonusFactor;
+
+      uint256 maxDebtLiquidationFactor = 1;
+      uint256 lastAmortizationTimestamp = 1;
+      uint256 minDebtThresholdValue = 1; // 4000 usd
+      uint256 maxAmortizationTime = 1; // 4000 usd
+      require(now.sub(lastAmortizationTimestamp) < maxAmortizationTime, "Error: Max amortization time not reached");
+
+      params.debtWrappedAsset = debtAsset.debtWrappedAsset;
+      params.debt = IERC20(params.debtWrappedAsset).balanceOf(params.borrower);
+      params.debtPrincipal = IDebtToken(params.debtWrappedAsset).balanceOfPrincipal(params.borrower);
+
+      uint256 amortizationToPayoff = params.debt.sub(params.debtPrincipal); // min liquidation amount
+      uint256 maxDebtToPayoff = params.debtPrincipal.wadMul(maxDebtLiquidationFactor).add(amortizationToPayoff); // 20% of principal + debt amortization
+      // if cacn liquidatt 100% of debt
+      if (
+        params.debtPrincipal < minDebtThresholdValue
+      ) {
+          maxDebtToPayoff = params.debt;
+      }
+
+      if (
+        amount > maxDebtToPayoff
+      ) {
+          amount = maxDebtToPayoff;
+      }
+
+      // amount must be greater than or equail to amortizationToPayoff  if over minDebtThresholdValue
+      if (
+        amount < amortizationToPayoff
+      ) {
+          revert("Error: Amount not enough");
+      }
+
+      params.debtAsset = debtAsset.asset;
+
+      params.repayDebtValue = _valueInEth(
+          params.debtAsset,
+          debtAsset.decimals,
+          amount,
+          _addressesProvider.getPriceOracle()
+      );
+
+      params.collateralLiquidationTotalValue = params.repayDebtValue.add(params.repayDebtValue.wadMul(liquidationBonusFactor));
+
+      // transfer in repay
+      // make sure to approve each debt ass repay amount
+      IERC20(params.debtAsset).safeTransferFrom(params.caller, debtAsset.wrapped, amount);
+      IDebtToken(params.debtWrappedAsset).burn(params.borrower, amount, debtAsset.borrowExchangeRate);
+
+      params.collateralValueInEth = _valueInEth(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          collateral,
+          _addressesProvider.getPriceOracle()
+      );
+
+      params.collateralReceiverValue = params.collateralLiquidationTotalValue >= params.collateralValueInEth ? params.collateralLiquidationTotalValue : params.collateralValueInEth;
+
+      params.collateralBonus = _amountFromEthValue(
+          collateralAsset.asset,
+          collateralAsset.decimals,
+          params.collateralReceiverValue,
+          _addressesProvider.getPriceOracle()
+      );
+
+      // burn and redeem
+      ICollateralToken(collateralAsset.collateralAssetWrapped).burn(params.borrower, params.caller, params.collateralBonus, collateralAsset.collateralExchangeRate);
+
+      emit LiquidationCall(
+          collateralAsset.asset,
+          params.debtAsset,
+          amount,
+          params.collateralBonus
+      );
+
+      return true;
+
+  } */
+
+  function _valueInEth(
+      address asset,
+      uint256 assetDecimals,
+      uint256 amount,
+      address priceOracle
+  ) internal view returns (uint256) {
+      amount = amount.mul(10**18).div(assetDecimals);
+      uint256 assetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(asset));
+      uint256 assetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(asset);
+
+      uint256 amountInEth = amount.mul(assetPrice).div(10**uint256(assetPriceDecimals));
+
+      return amountInEth;
+  }
+
+  function _amountFromEthValue(
+      address asset,
+      uint256 assetDecimals,
+      uint256 amountValue,
+      address priceOracle
+  ) internal view returns (uint256) {
+      amountValue = amountValue.mul(assetDecimals).div(10**18);
+      uint256 assetPrice = uint256(IPriceConsumerV3(priceOracle).getLatestPrice(asset));
+      uint256 assetPriceDecimals = IPriceConsumerV3(priceOracle).decimals(asset);
+
+      uint256 amountFromEthValue = amountValue.div(assetPrice).div(10**uint256(assetPriceDecimals));
+
+      return amountFromEthValue;
+  }
+}

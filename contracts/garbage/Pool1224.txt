@@ -1,0 +1,900 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {ArrayMath} from '../libraries/ArrayMath.sol';
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+import {PoolStorage} from './PoolStorage.sol';
+import {IPool} from './IPool.sol';
+import {PoolLogic} from '../libraries/PoolLogic.sol';
+import {ICollateralToken} from '../tokens/ICollateralToken.sol';
+import {IAvaToken} from '../tokens/IAvaToken.sol';
+import {IDebtToken} from '../tokens/IDebtToken.sol';
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {IRewardsTokenBase} from '../tokens/IRewardsTokenBase.sol';
+import {ILiquidationCaller} from './ILiquidationCaller.sol';
+
+import "hardhat/console.sol";
+
+// actual
+// Vaults like DAI/UST are required because debt rates are determined by collateral to ensure
+// the return on collateral alone is higher than the debt repayments
+contract Pool is Initializable, UUPSUpgradeable, OwnableUpgradeable, IPool, PoolStorage {
+    using SafeMath for uint256;
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using WadRayMath for uint256;
+    using ArrayMath for uint256;
+
+    modifier whenNotPaused() {
+        require(!paused, "Errors: Pool paused");
+        _;
+    }
+
+    function getAddressesProvider() external view override returns (address) {
+        // in storage
+        return address(addressesProvider);
+    }
+
+    function initialize(IPoolAddressesProvider provider) external initializer {
+        addressesProvider = provider;
+    }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    function depositCollateral(
+        address _collateralAsset, //
+        address account, // on behalf of
+        uint256 amount// collateral amount
+    ) external override whenNotPaused {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        IERC20Upgradeable(collateralAsset.asset).safeTransferFrom(msg.sender, collateralAsset.collateralAssetWrapped, amount);
+
+        // funds borrowers account
+        ICollateralToken(collateralAsset.collateralAssetWrapped).deposit(
+            msg.sender,
+            amount
+        );
+    }
+
+    function borrow(
+        address _collateralAsset, //
+        address _debtAsset, // wrapp to borrow
+        address account, // on behalf of
+        uint256 amount// collateral amount
+    ) external override whenNotPaused {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+        PoolAsset storage debtAsset = poolAssets[_debtAsset];
+        Position storage position = positions[_collateralAsset][_debtAsset][msg.sender];
+
+
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        uint256 collateralValueAvailableInEth = PoolLogic.getCollateralValueAvailableInEth(
+            poolAssets,
+            collateralAssetsList,
+            collateralAssetsCount,
+            msg.sender,
+            amount,
+            addressesProvider.getPriceOracle()
+        );
+        console.log("borrow collateralValueAvailableInEth", collateralValueAvailableInEth);
+
+        PoolLogic.validateBorrowAndGetData(
+            collateralAsset,
+            debtAsset,
+            collateralValueAvailableInEth,
+            msg.sender,
+            addressesProvider.getPriceOracle(),
+            amount
+        );
+
+        PoolLogic.updateState(
+            collateralAsset,
+            debtAsset,
+            msg.sender,
+            0,
+            position
+        );
+
+        uint256 collateralAmount = amount.mul(10**collateralAsset.decimals).div(10**debtAsset.decimals);
+
+        ICollateralToken(collateralAsset.collateralAssetWrapped).mintOnBorrow(
+            msg.sender,
+            collateralAmount,
+            collateralAsset.collateralExchangeRate
+        );
+
+        // mint token
+        IDebtToken(debtAsset.debtWrappedAsset).mint(
+            _collateralAsset,
+            msg.sender,
+            amount,
+            debtAsset.borrowExchangeRate
+        );
+        // transfer underlying to borrower
+        IAvaToken(debtAsset.wrapped).transferUnderlyingTo(msg.sender, amount);
+
+        // collateral runs at a discount to the actual APY.
+        // reason: interoperable calculation issues may occur
+        // any excess appreciation is sent to our liquidity vault to be used for avaTokens
+        ICollateralToken(collateralAsset.collateralAssetWrapped).supplyLiquidityVault(_debtAsset, addressesProvider.getLiquidityVault());
+    }
+
+    // bonus
+    function depositCollateralAndBorrow(
+        address _collateralAsset, //
+        address _debtAsset, // wrapp to borrow
+        address account, // on behalf of
+        uint256 amount// collateral amount
+    ) external override whenNotPaused {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+        PoolAsset storage debtAsset = poolAssets[_debtAsset];
+        UserData storage userData = usersData[_debtAsset][msg.sender];
+        Position storage position = positions[_collateralAsset][_debtAsset][msg.sender];
+
+
+        /* Position storage position = positions[_collateralAsset][_debtAsset][msg.sender]; */
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        uint256 borrowAmount = amount;
+
+        // requirements
+        // user isn't already borrowing
+
+        PoolLogic.validateDepositCollateralAndBorrow(
+            collateralAsset,
+            debtAsset,
+            userData,
+            addressesProvider.getPriceOracle(),
+            amount,
+            borrowAmount
+        );
+        // transfer in asset to collateral instance
+        IERC20Upgradeable(collateralAsset.asset).safeTransferFrom(msg.sender, collateralAsset.collateralAssetWrapped, amount);
+
+        // mint token
+        // send assets to anchor
+        // we use bonus factor instead of amount+bonus to accuratly supply bridge with `amount`
+        (uint256 amountBack, uint256 scaledCollateral) = ICollateralToken(collateralAsset.collateralAssetWrapped).mint(
+            msg.sender,
+            amount,
+            collateralAsset.collateralExchangeRate
+        );
+
+
+        //update amount for amountBack
+        // if amount back is > === allow higher collateral principal luck
+        borrowAmount = amountBack > amount ? borrowAmount : amountBack;
+
+        borrowAmount = PoolLogic.getAssetValueMatchAmountFromAsset(
+            addressesProvider.getPriceOracle(),
+            borrowAmount,
+            collateralAsset.decimals,
+            debtAsset
+        );
+
+        PoolLogic.updateState(
+            collateralAsset,
+            debtAsset,
+            msg.sender,
+            0,
+            position
+        );
+        // send out asset 1:1
+        // mint token
+        IDebtToken(debtAsset.debtWrappedAsset).mint(
+            msg.sender,
+            borrowAmount,
+            debtAsset.borrowExchangeRate
+        );
+
+        // transfer underlying to borrower
+        IAvaToken(debtAsset.wrapped).transferUnderlyingTo(msg.sender, borrowAmount);
+
+        emit DepositCollateralAndBorrow(
+            msg.sender,
+            _collateralAsset,
+            _debtAsset,
+            amount,
+            borrowAmount // amount can be differentt due to bonus
+        );
+
+    }
+
+    function depositSavings(
+        address account,
+        address asset, // savings asset
+        uint256 amount
+    ) external whenNotPaused override {
+        PoolAsset storage poolAsset = poolAssets[asset];
+        console.log("in depositSavings");
+        // dont check amount, bridge reverts is min not hit
+        PoolLogic.validateDepositSavings(
+            poolAsset
+        );
+        // update exchangeRate
+        // get rate
+
+        PoolLogic.accrueInterest(
+            poolAsset
+        );
+
+        console.log("in depositSavings after accrueInterest");
+
+        // send underlying deposited to wrapped token contract
+        // transfer from msg.sender
+        IERC20Upgradeable(asset).safeTransferFrom(msg.sender, poolAsset.wrapped, amount);
+        console.log("in depositSavings after safeTransferFrom");
+        // how much to send to anchor
+        // accounts for bridging fees
+        uint256 bridgeSupplyAmount = PoolLogic.bridgeSupplyOnDepositSavings(
+            poolAsset,
+            addressesProvider.getRouter(),
+            amount
+        );
+        console.log("in depositSavings after bridgeSupplyAmount", bridgeSupplyAmount);
+
+        // mint token to account
+        IAvaToken(poolAsset.wrapped).mint_(
+            account,
+            amount.sub(bridgeSupplyAmount),
+            bridgeSupplyAmount,
+            poolAsset.overallExchangeRate
+        );
+        console.log("in depositSavings after mint_");
+
+        emit DepositSavings(
+            msg.sender,
+            asset,
+            amount
+        );
+
+    }
+
+    struct repayAndWithdrawParams {
+        address _collateralAsset;
+        address _debtAsset;
+
+    }
+    // repay debt and withdraw collateral
+    // only full repay
+    function repayAndWithdraw(
+        address _collateralAsset,
+        address _debtAsset,
+        uint256 collateralWithdrawFactor, // factor of repay amount to withdraw as collateral
+        uint256 amount
+    ) external whenNotPaused override {
+        repayAndWithdrawParams memory params;
+        params._collateralAsset = _collateralAsset;
+        params._debtAsset = _debtAsset;
+
+        PoolAsset storage collateralAsset = poolAssets[params._collateralAsset];
+        PoolAsset storage debtAsset = poolAssets[params._debtAsset];
+        Position storage position = positions[params._collateralAsset][params._debtAsset][msg.sender];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        // requirements
+        // repay >= debt
+        // update repay amount if >
+        // get user debt amount
+        // upates amortizationTimestamp if >
+
+        (uint256 debt, uint256 removedFromPrincipal, uint256 repayAmount) = PoolLogic.confirmRepayAmount(
+            debtAsset.debtWrappedAsset,
+            position,
+            amount
+        );
+        console.log("repayAndWithdraw repayAmount", repayAmount);
+        console.log("repayAndWithdraw debt       ", debt);
+
+        // requirements
+        // min timeframe reached
+        PoolLogic.validateRepayAndWithdraw(
+            debtAsset,
+            collateralAsset,
+            repayAmount,
+            debt
+        );
+
+        uint256 totalDebt = PoolLogic.getUserTotalDebtInCollateral(
+            poolAssets,
+            positions,
+            savingsAssetsList,
+            savingsAssetsCount,
+            msg.sender,
+            params._collateralAsset,
+            collateralAsset.decimals,
+            addressesProvider.getPriceOracle()
+        );
+
+        PoolLogic.updateState(
+            collateralAsset,
+            debtAsset,
+            msg.sender,
+            repayAmount,
+            position
+        );
+
+        uint256 collateralBurnAmount = removedFromPrincipal.wadMul(collateralWithdrawFactor);
+        uint256 idleAmount = removedFromPrincipal.wadMul(uint256(1e18).sub(collateralWithdrawFactor));
+        if (repayAmount >= totalDebt) {
+            // release all collateral when all debt is zero
+            uint256 totalCollateralBalance = IERC20Upgradeable(collateralAsset.collateralAssetWrapped).balanceOf(msg.sender);
+            collateralBurnAmount = totalCollateralBalance.wadMul(collateralWithdrawFactor);
+            idleAmount = totalCollateralBalance.wadMul(uint256(1e18).sub(collateralWithdrawFactor));
+        }
+
+        /* uint256 collateralBurnAmount = IERC20Upgradeable(collateralAsset.collateralAssetWrapped).balanceOf(msg.sender); */
+        /* PoolLogic.validateWithdrawCollateralAmount(
+            totalCollateral,
+            withdrawAmount
+        ); */
+
+        ICollateralToken(collateralAsset.collateralAssetWrapped).burn(msg.sender, msg.sender, collateralBurnAmount, collateralAsset.collateralExchangeRate);
+
+        PoolLogic.updateCollateralIdle(
+            msg.sender,
+            collateralAsset,
+            _debtAsset,
+            debtAsset.decimals,
+            repayAmount,
+            addressesProvider.getPriceOracle()
+        );
+
+        // allows borrower to withdraw collateral on 0 debt balance
+        // can happen on full liquidations
+        if (repayAmount > 0) {
+            IDebtToken(debtAsset.debtWrappedAsset).burn(params._collateralAsset, msg.sender, repayAmount, debtAsset.borrowExchangeRate);
+            // transfer in debt asset to repay
+            IERC20Upgradeable(params._debtAsset).safeTransferFrom(msg.sender, debtAsset.wrapped, repayAmount);
+        }
+
+        // collateral runs at a discount to the actual APY.
+        // reason: interoperable calculation issues may occur
+        // any excess appreciation is sent to our liquidity vault to be used for avaTokens
+        ICollateralToken(collateralAsset.collateralAssetWrapped).supplyLiquidityVault(params._debtAsset, addressesProvider.getLiquidityVault());
+
+        // may not need here sine debt repay is accounted for
+        emit RepayAndWithdraw(
+            msg.sender,
+            params._collateralAsset,
+            params._debtAsset,
+            repayAmount
+        );
+
+    }
+
+    function repay(
+        address _collateralAsset,
+        address _debtAsset,
+        address account,
+        uint256 amount
+    ) external whenNotPaused override {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+        PoolAsset storage debtAsset = poolAssets[_debtAsset];
+        Position storage position = positions[_collateralAsset][_debtAsset][msg.sender];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        // requirements
+        // repay >= debt
+        // update repay amount if >
+        // get user debt amount
+        // upates amortizationTimestamp if >
+        (uint256 debt, uint256 removedFromPrincipal, uint256 repayAmount) = PoolLogic.confirmRepayAmount(
+            debtAsset.debtWrappedAsset,
+            position,
+            amount
+        );
+        console.log("repay repayAmount", repayAmount);
+        console.log("repay debt       ", debt);
+
+        // requirements
+        // min timeframe reached
+        PoolLogic.validateRepay(
+            debtAsset,
+            repayAmount,
+            debt
+        );
+        console.log("repay after validateRepay");
+
+        PoolLogic.updateState(
+            collateralAsset,
+            debtAsset,
+            msg.sender,
+            repayAmount,
+            position
+        );
+
+        console.log("repay in loop");
+
+        PoolLogic.updateCollateralIdle(
+            msg.sender,
+            collateralAsset,
+            _debtAsset,
+            debtAsset.decimals,
+            removedFromPrincipal,
+            addressesProvider.getPriceOracle()
+        );
+
+
+
+        /* IDebtToken(debtAsset.debtWrappedAsset).burn(msg.sender, repayAmount, debtAsset.borrowExchangeRate); */
+        IDebtToken(debtAsset.debtWrappedAsset).burn(_collateralAsset, msg.sender, repayAmount, debtAsset.borrowExchangeRate);
+        // transfer in debt asset to repay
+        IERC20Upgradeable(_debtAsset).safeTransferFrom(msg.sender, debtAsset.wrapped, repayAmount);
+
+        // collateral runs at a discount to the actual APY.
+        // reason: interoperable calculation issues may occur
+        // any excess appreciation is sent to our liquidity vault to be used for avaTokens
+        ICollateralToken(collateralAsset.collateralAssetWrapped).supplyLiquidityVault(_debtAsset, addressesProvider.getLiquidityVault());
+
+    }
+
+
+    /* function withrawCollateral(
+        address _collateralAsset,
+        address _debtAsset,
+        uint256 amount
+    ) external whenNotPaused  {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+        PoolAsset storage debtAsset = poolAssets[_debtAsset];
+        Position storage position = positions[_collateralAsset][_debtAsset][msg.sender];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        ( , uint256 averageLtvThreshold) = PoolLogic.getUserTotalDebtValueInCollateral(
+            poolAssets,
+            positions,
+            savingsAssetsList,
+            savingsAssetsCount,
+            msg.sender,
+            _collateralAsset,
+            collateralAsset.decimals,
+            addressesProvider.getPriceOracle()
+        );
+
+        // requirements
+        // repay >= debt
+        // update repay amount if >
+        // get user debt amount
+        // upates amortizationTimestamp if >
+        uint256 withdrawAmount = PoolLogic.confirmCollateralWithdrawAmount(
+            position,
+            collateralAsset,
+            amount,
+            averageLtvThreshold,
+            addressesProvider.getPriceOracle()
+        );
+        console.log("withrawCollateral withdrawAmount", withdrawAmount);
+
+        // transfer in debt asset to repay
+        IERC20Upgradeable(_collateralAsset).safeTransferFrom(msg.sender, collateralAsset.collateralAssetWrapped, withdrawAmount);
+
+        // collateral runs at a discount to the actual APY.
+        // reason: interoperable calculation issues may occur
+        // any excess appreciation is sent to our liquidity vault to be used for avaTokens
+        ICollateralToken(collateralAsset.collateralAssetWrapped).supplyLiquidityVault(_debtAsset, addressesProvider.getLiquidityVault());
+
+    } */
+
+    /// withdraws idle collateral
+    function withdrawCollateral(
+        address _collateralAsset,
+        uint256 amount
+    ) external whenNotPaused  {
+        PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        uint256 availableToWithdraw = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAvailablePrincipal(msg.sender);
+        console.log("withrawCollateral availableToWithdraw       ", availableToWithdraw);
+
+        uint256 withdrawAmount = amount > availableToWithdraw ? availableToWithdraw : amount;
+        // transfer in debt asset to repay
+        console.log("withrawCollateral withdrawAmount", withdrawAmount);
+
+        uint256 totalCollateral = ICollateralToken(collateralAsset.collateralAssetWrapped).balanceOfAndPrincipal(msg.sender);
+
+        PoolLogic.validateWithdrawCollateralAmount(
+            totalCollateral,
+            withdrawAmount
+        );
+
+        ICollateralToken(collateralAsset.collateralAssetWrapped).redeemIdle(msg.sender, withdrawAmount);
+    }
+
+
+
+
+    function withdrawSavings(
+        address account,
+        address asset,
+        uint256 amount,
+        bool emergency
+    ) external whenNotPaused override {
+        PoolAsset storage poolAsset = poolAssets[asset];
+
+        PoolLogic.accrueInterest(
+            poolAsset
+        );
+
+        // amount to withdraw from anchor and send directly to user
+        // this is the difference between current amount in anchor minus amount required in anchor after withdraw
+        uint256 redeemToAccountAmount = PoolLogic.bridgeRemovalOnWithdrawSavings(
+            poolAsset,
+            amount
+        );
+
+        PoolLogic.validateWithdrawSavings(
+            poolAsset,
+            msg.sender,
+            amount,
+            redeemToAccountAmount
+            /* emergency */
+        );
+
+        if (redeemToAccountAmount != 0) {
+            // decimals update in _redeem
+            IAvaToken(poolAsset.wrapped)._redeem(
+                poolAsset.bridgeAddress,
+                redeemToAccountAmount,
+                msg.sender,
+                emergency
+            );
+        }
+
+        // redeemToAccountAmount doesn't inlude fees therefor can be reduced from totalDepositsLendable
+
+        IAvaToken(poolAsset.wrapped).burn_(
+            msg.sender,
+            amount,
+            redeemToAccountAmount,
+            poolAsset.overallExchangeRate
+        );
+
+        emit WithdrawSavings(
+            msg.sender,
+            asset,
+            amount
+        );
+    }
+
+    // tracks lendable deposit assets (deposits - bridged deposits)
+    function updateTotalDepositsLendable(address asset, uint256 amountAdded, uint256 amountRemoved) external override {
+        PoolAsset storage poolAsset = poolAssets[asset];
+        poolAsset.totalDepositsLendable = poolAsset.totalDepositsLendable.add(amountAdded).sub(amountRemoved);
+    }
+
+    struct liquidationCallParams {
+        address borrower;
+        address _debtAsset;
+        address _collateralAsset;
+    }
+
+    /* struct LiquidationCallStructParams {
+        address borrower;
+        address caller;
+        uint256 amount;
+        address _debtAsset;
+        address debtWrappedAsset;
+        address _collateralAsset;
+        uint256 maxDebtLiquidationFactor;
+        uint256 minDebtThresholdValue;
+        uint256 maxAmortizationTime;
+        address collateralAssetWrapped;
+        uint256 liquidationBonusFactor;
+        uint256 collateralDecimals;
+        uint256 collateralAssetExchangeRate;
+    } */
+
+    function liquidationCall(
+        address borrower,
+        address _debtAsset,
+        address _collateralAsset,
+        uint256 amount
+    ) external override whenNotPaused {
+        /* liquidationCallParams memory params;
+        params.borrower = borrower;
+        params._debtAsset = _debtAsset;
+        params._collateralAsset = _collateralAsset; */
+
+        PoolStorage.PoolAsset storage debtAsset = poolAssets[_debtAsset];
+        PoolStorage.PoolAsset storage collateralAsset = poolAssets[_collateralAsset];
+        UserData storage userData = usersData[_debtAsset][borrower];
+
+        PoolLogic.accrueInterest(
+            collateralAsset
+        );
+
+        PoolLogic.accrueInterest(
+            debtAsset
+        );
+
+        uint256 currentTimestamp = block.timestamp;
+        uint256 lastAmortizationTimestamp = userData.lastAmortizationTimestamp;
+        uint256 maxAmortizationTime = 1; // 4000 usd
+
+        require(currentTimestamp.sub(lastAmortizationTimestamp) > maxAmortizationTime, "Error: Amortization time not yet met");
+
+
+        // require timeframe
+        // require debt
+        PoolLogic.validateLiquidationCall(
+            collateralAsset,
+            debtAsset,
+            /* userData, */
+            borrower
+        );
+
+
+        /* ILiquidationCaller.LiquidationCallStructParams memory params =
+            ILiquidationCaller.LiquidationCallStructParams({
+                borrower: borrower,
+                caller: msg.sender,
+                amount: amount,
+                _debtAsset: _debtAsset,
+                debtWrappedAsset: debtAsset.debtWrappedAsset,
+                _collateralAsset: _collateralAsset,
+                maxDebtLiquidationFactor: debtAsset.maxDebtLiquidationFactor,
+                minDebtThresholdValue: debtAsset.minDebtThresholdValue,
+                maxAmortizationTime: debtAsset.maxAmortizationTime,
+                collateralAssetWrapped: collateralAsset.collateralAssetWrapped,
+                liquidationBonusFactor: collateralAsset.liquidationBonusFactor,
+                collateralDecimals: collateralAsset.decimals,
+                collateralAssetExchangeRate: collateralAsset.collateralExchangeRate
+            });
+
+        bool success = ILiquidationCaller(addressesProvider.getLiquidationCaller()).liquidationCallV2(params); */
+
+        bool success = ILiquidationCaller(addressesProvider.getLiquidationCaller()).liquidationCall(
+            borrower,
+            msg.sender,
+            collateralAsset,
+            _debtAsset,
+            amount
+        );
+
+    }
+
+    // for PoolAssetData.sol
+    function getPoolAssetData(address asset)
+        external
+        view
+        override
+        returns (PoolStorage.PoolAsset memory)
+    {
+        return poolAssets[asset];
+    }
+
+    /* function getUserData(address user)
+        external
+        view
+        override
+        returns (PoolStorage.UserData memory)
+    {
+        return usersData[user];
+    } */
+
+
+    modifier onlyPoolAdmin() {
+        require(msg.sender == addressesProvider.getPoolAdmin());
+        _;
+    }
+
+    modifier onlyCollateralTokenFactory() {
+        require(msg.sender == addressesProvider.getCollateralTokenFactory());
+        _;
+    }
+
+    modifier onlySavingsTokenFactory() {
+        require(msg.sender == addressesProvider.getSavingsTokenFactory());
+        _;
+    }
+
+
+    modifier onlyDebtTokenFactory() {
+        require(msg.sender == addressesProvider.getDebtTokenFactory());
+        _;
+    }
+
+    // get collateralAssets
+
+    function updateBridgeAddress(address asset, address _bridgeAddress) external onlyPoolAdmin {
+        poolAssets[asset].bridgeAddress = _bridgeAddress;
+    }
+
+    function updateLtv(address asset, uint256 _ltv) external onlyPoolAdmin {
+        poolAssets[asset].ltv = _ltv;
+    }
+
+    function updateReserve(address asset, address _reserve) external onlyPoolAdmin {
+        poolAssets[asset].reserve = _reserve;
+    }
+
+    function updateReserveFactor(address asset, uint256 _reserveFactor) external onlyPoolAdmin {
+        poolAssets[asset].reserveFactor = _reserveFactor;
+    }
+
+    function updateIsOn(address asset, bool _isActive) external onlyPoolAdmin {
+        poolAssets[asset].on = _isActive;
+    }
+
+    function updateCollateralExchangeRateFactor(address asset, uint256 _collateralExchangeRateFactor) external onlyPoolAdmin {
+        poolAssets[asset].collateralInterestRateFactor = _collateralExchangeRateFactor;
+    }
+
+    function updateDebtInterestRateFactor(address asset, uint256 _debtInterestRateFactor) external onlyPoolAdmin {
+        poolAssets[asset].debtInterestRateFactor = _debtInterestRateFactor;
+    }
+
+    function updateDepositsSuppliedInterestRateFactor(address asset, uint256 _depositsSuppliedInterestRateFactor) external onlyPoolAdmin {
+        poolAssets[asset].depositsSuppliedInterestRateFactor = _depositsSuppliedInterestRateFactor;
+    }
+
+
+
+    /* function initRewards(
+        address rewardsBase,
+        address wrapped
+    ) external override onlyPoolAdmin {
+        IRewardsTokenBase(wrapped).setRewards(
+            rewardsBase
+        );
+    } */
+
+    function initCollateralToken(
+        address asset,
+        address wrapped,
+        address exchangeRateData,
+        /* address bridgeExchangeRateFeederAddress, */
+        uint256 bridgeMinSupplyRedeemAmount,
+        uint256 bridgeMaxSupplyRedeemAmount,
+        uint256 collateralInterestRateFactor
+    ) external onlyCollateralTokenFactory override {
+        PoolAsset storage collateralAsset = poolAssets[asset];
+        console.log("in initcol token");
+        PoolLogic.initCollateralToken(
+            collateralAsset, // struct
+            asset, // underlying
+            wrapped, // collateral asset
+            exchangeRateData,
+            /* bridgeExchangeRateFeederAddress, */
+            bridgeMinSupplyRedeemAmount,
+            bridgeMaxSupplyRedeemAmount,
+            collateralInterestRateFactor
+        );
+
+        addPoolAssetToListInternal(asset);
+        addCollateralAssetToListInternal(asset);
+        emit CollateralTokenInit(
+            asset,
+            wrapped
+        );
+    }
+
+    function initSavingsToken(
+        address asset,
+        address wrapped,
+        address exchangeRateData,
+        uint256 bridgeMinSupplyRedeemAmount,
+        uint256 depositsSuppliedInterestRateFactor
+    ) external onlySavingsTokenFactory override {
+        PoolAsset storage poolAsset = poolAssets[asset];
+        // require to not init > 1
+        PoolLogic.initSavingsToken(
+            poolAsset,
+            asset,
+            wrapped,
+            exchangeRateData,
+            bridgeMinSupplyRedeemAmount,
+            depositsSuppliedInterestRateFactor
+        );
+        addPoolAssetToListInternal(asset);
+        addSavingsAssetToListInternal(asset);
+        emit SavingsTokenInit(
+            asset,
+            wrapped
+        );
+    }
+
+    function initDebtToken(
+        address asset,
+        address debtWrappedAsset,
+        uint256 debtInterestRateFactor,
+        uint256 ltv
+    ) external onlyDebtTokenFactory override {
+        PoolAsset storage poolAsset = poolAssets[asset];
+        PoolLogic.initDebtToken(
+            poolAsset,
+            debtWrappedAsset,
+            debtInterestRateFactor,
+            ltv
+        );
+    }
+
+    function addCollateralAssetToListInternal(address asset) internal {
+        uint256 _collateralAssetsCount = collateralAssetsCount;
+        bool poolCollateralAssetAlreadyAdded = false;
+        for (uint256 i = 0; i < _collateralAssetsCount; i++)
+            if (collateralAssetsList[i] == asset) {
+                poolCollateralAssetAlreadyAdded = true;
+            }
+        if (!poolCollateralAssetAlreadyAdded) {
+            collateralAssetsList[collateralAssetsCount] = asset;
+            collateralAssetsCount = _collateralAssetsCount + 1;
+        }
+    }
+
+    function addPoolAssetToListInternal(address asset) internal {
+        uint256 _poolAssetsCount = poolAssetsCount;
+        bool poolAssetAlreadyAdded = false;
+        for (uint256 i = 0; i < _poolAssetsCount; i++)
+            if (poolAssetsList[i] == asset) {
+                poolAssetAlreadyAdded = true;
+            }
+        if (!poolAssetAlreadyAdded) {
+            poolAssetsList[poolAssetsCount] = asset;
+            poolAssetsCount = _poolAssetsCount + 1;
+        }
+    }
+
+    function addSavingsAssetToListInternal(address asset) internal {
+        uint256 _savingsAssetsCount = savingsAssetsCount;
+        bool poolSavingsAssetAlreadyAdded = false;
+        for (uint256 i = 0; i < _savingsAssetsCount; i++)
+            if (savingsAssetsList[i] == asset) {
+                poolSavingsAssetAlreadyAdded = true;
+            }
+        if (!poolSavingsAssetAlreadyAdded) {
+            savingsAssetsList[savingsAssetsCount] = asset;
+            savingsAssetsCount = _savingsAssetsCount + 1;
+        }
+    }
+
+}

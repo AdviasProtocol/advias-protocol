@@ -1,0 +1,166 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+import {PoolStorage} from './PoolStorage.sol';
+
+interface IPool {
+
+  function getAddressesProvider() external view returns (address);
+
+  event DepositSavings(
+      address user,
+      address asset,
+      /* address wrapped, */
+      uint256 amount
+  );
+
+  function depositSavings(
+      address account,
+      address asset,
+      uint256 amount
+  ) external;
+
+  /* event Rebalance(
+      address asset,
+      uint256 deposit,
+      uint256 redeem
+  ); */
+
+  event DepositCollateralAndBorrow(
+      address user,
+      address collateralAsset,
+      /* address collateralAssetWrapped, */
+      address debtAsset,
+      /* address debtAssetWrapped, */
+      uint256 collateralAmount,
+      uint256 borrowAmount
+  );
+
+  function depositCollateral(
+      address _collateralAsset, //
+      address account, // on behalf of
+      uint256 amount// collateral amount
+  ) external;
+
+  function borrow(
+      address _collateralAsset, //
+      address _debtAsset, // wrapp to borrow
+      address account, // on behalf of
+      uint256 amount// collateral amount
+  ) external;
+
+  function depositCollateralAndBorrow(
+      address _collateralAsset, //
+      address _debtAsset, // wrapp to borrow
+      address account, // on behalf of
+      uint256 amount
+  ) external;
+
+  event RepayAndWithdraw(
+      address user,
+      address collateralAsset,
+      /* address collateralAssetWrapped, */
+      address debtAsset,
+      /* address debtAssetWrapped, */
+      uint256 amount
+  );
+
+  function repayAndWithdraw(
+      address _collateralAsset,
+      address _debtAsset,
+      uint256 collateralWithdrawFactor,
+      /* address account, */
+      uint256 amount
+  ) external;
+
+  /* function repay(
+      address[] memory collateralAssets,
+      uint256[] memory collateralAssetsFactors,
+      address _debtAsset,
+      address account,
+      uint256 amount
+  ) external; */
+
+  function repay(
+      address _collateralAsset,
+      address _debtAsset,
+      address account,
+      uint256 amount
+  ) external;
+
+  event WithdrawSavings(
+      address user,
+      address asset,
+      /* address assetWrapped, */
+      uint256 amount
+  );
+
+  function withdrawSavings(
+      address account,
+      address asset,
+      uint256 amount,
+      bool emergency
+  ) external;
+
+  event LiquidationCall(
+      address _collateralAsset,
+      address _debtAsset,
+      uint256 repayAmount,
+      uint256 receiverAmount
+  );
+
+  function liquidationCall(
+      address borrower,
+      address _debtAsset,
+      address _collateralAsset,
+      uint256 amount
+  ) external;
+
+  function getPoolAssetData(address asset) external view returns (PoolStorage.PoolAsset memory);
+
+  /* function getUserData(address user) external view returns (PoolStorage.UserData memory); */
+
+  function updateTotalDepositsLendable(address asset, uint256 amountAdded, uint256 amountRemoved) external;
+
+  /* function initRewards(
+      address rewardsBase,
+      address wrapped
+  ) external; */
+
+  event CollateralTokenInit(
+      address asset,
+      address wrapped
+  );
+
+  function initCollateralToken(
+      address asset,
+      address wrapped,
+      address bridgeAddress,
+      /* address bridgeExchangeRateFeederAddress, */
+      uint256 bridgeMinSupplyRedeemAmount,
+      uint256 bridgeMaxSupplyRedeemAmount,
+      uint256 collateralInterestRateFactor
+  ) external;
+
+  event SavingsTokenInit(
+      address asset,
+      address wrapped
+  );
+
+  function initSavingsToken(
+      address asset,
+      address wrapped,
+      address bridgeAddress, // conversionPool for non-UST
+      /* uint256 bridgeMaxSupplyAllottedFactor, */
+      uint256 bridgeMinSupplyRedeemAmount,
+      /* uint256 bridgeMaxSupplyRedeemAmount, */
+      uint256 depositsSuppliedInterestRateFactor
+  ) external;
+
+  function initDebtToken(
+      address asset,
+      address debtWrappedAsset,
+      uint256 debtInterestRateFactor,
+      uint256 ltv
+  ) external;
+
+}

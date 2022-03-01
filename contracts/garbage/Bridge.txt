@@ -1,0 +1,494 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {Context} from "@openzeppelin/contracts/utils/Context.sol";
+import {IExchangeRateFeeder} from "./interfaces/IExchangeRateFeeder.sol";
+import {IBridge} from "./IBridge.sol";
+import {IConversionRouterV2} from "./interfaces/IRouterV2.sol";
+import {IRouterV2} from "./interfaces/IRouterV2.sol";
+import {ISwapper} from "../swapper/ISwapper.sol";
+import {ExchangeRateFeederData} from './interfaces/IExchangeRateFeeder.sol';
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from '../interfaces/IPoolAddressesProvider.sol';
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+import "hardhat/console.sol";
+
+// swaps assets to UST to send to routere for deposit or redeem
+/* contract Bridge is IBridge, Context, Ownable { */
+
+/**
+ * @title Bridge
+ * @author Advias
+ * @title Bridges to Anchor
+ */
+contract Bridge is IBridge, Context {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+    using WadRayMath for uint256;
+
+    uint256 constant ONE  = 1e18;
+
+    uint256 public bridgeFee;
+    uint256 public minBridgeCost;
+    uint256 public swapFee; // fee charged by swapping through anchor on withdraw
+    uint256 public stabilityFee; // stabilityFee
+    /* uint256 public taxCap; // TobinTax */
+    uint256 public sdtPrice; // price of SDT
+    uint256 public uusdGasRate;
+    uint256 public anchorGasTx; // amount gas anchor uses to mint aust
+
+
+    // pool token settings
+    IERC20 public inputToken; // DAI / USDC / USDT
+    /* IERC20Controlled public outputToken; // aDAI / aUSDC / aUSDT */
+    uint256 public _inputTokenDecimals;
+    // swap settings
+    ISwapper public swapper;
+
+    address public optRouter;
+    IExchangeRateFeeder public feeder;
+    ExchangeRateFeederData public feederData;
+
+    IPoolAddressesProvider private addressesProvider;
+
+
+    // flags
+    bool public isDepositAllowed = true;
+    bool public isRedemptionAllowed = true;
+
+    IERC20 public aUST;
+    uint256 public _aUSTdecimals = 18;
+    IERC20 public UST;
+    uint256 public _USTdecimals = 18;
+
+    address public caller;
+    bool public requireCaller;
+
+    uint256 public ONE_YR;
+
+    enum Status {NEUTRAL, RUNNING, STOPPED}
+
+    struct TokenData {
+        ExchangeRateFeederData.Status status;
+        uint256 exchangeRate;
+        uint256 period;
+        uint256 weight;
+        uint256 lastUpdatedAt;
+        uint256 interestRate; //ray
+    }
+
+    TokenData public tokenData;
+
+    function _tokenData() external view returns (TokenData memory) {
+        return tokenData;
+    }
+
+    constructor(
+        IPoolAddressesProvider _addressesProvider,
+        address _router,
+        address _feeder,
+        address _swapper, // in-house swappeer Not anchors
+        address _ust,
+        address _aust,
+        address _mainToken, // DAI , UST, USDC
+        address _caller // wrapped contract calling this
+    ) {
+        addressesProvider = _addressesProvider;
+        ONE_YR = 31536000;
+        UST = IERC20(_ust);
+        aUST = IERC20(_aust);
+        setInputToken(_mainToken);
+        setSwapper(_swapper);
+        setOperationRouter(_router);
+        setExchangeRateFeeder(_feeder);
+        setDepositAllowance(true);
+        setRedemptionAllowance(true);
+        setCaller(_caller);
+        requireCaller = true;
+        setExchangeRateFeederData(_feeder);
+        initData();
+        bridgeFee = uint256(1000000000000000); // terra bridge fee
+        minBridgeCost = uint256(1000000000000000000); // $1.00
+
+        swapFee = uint256(3000000000000000); // anchor eth swap fee through uniswap v2 | uint256(400000000000000) for mainnet through curve meta
+        /* tax = uint256(2941811080725897); */
+        stabilityFee = uint256(3500000000000000); // anchor eth swap fee through uniswap v2 | uint256(400000000000000) for mainnet through curve meta
+        sdtPrice = uint256(1240000000000000000); // $1.24 UST at deploy --- max stabilityFee cost
+        uusdGasRate = uint256(150000000000000000); // 15c UST at deploy --- max stabilityFee cost
+        anchorGasTx = uint256(1000000000000000000000000); // minting uses 1,000,000 gas at deploy
+    }
+
+
+    function setInputToken(address _mainToken) public onlyBridgeFactoryOrPoolAdmin {
+        inputToken = IERC20(_mainToken);
+        _inputTokenDecimals = IERC20Metadata(_mainToken).decimals();
+    }
+
+    function updateOneYear(uint256 x) public onlyBridgeFactoryOrPoolAdmin {
+        ONE_YR = x;
+    }
+
+    function setSwapper(address _swapper) public onlyBridgeFactoryOrPoolAdmin {
+        if (address(UST) != address(inputToken)) {
+            swapper = ISwapper(_swapper);
+            inputToken.safeIncreaseAllowance(address(swapper), type(uint256).max);
+        }
+    }
+
+    function setOperationRouter(address _optRouter) public onlyBridgeFactoryOrPoolAdmin {
+        optRouter = _optRouter;
+        UST.safeIncreaseAllowance(optRouter, type(uint256).max);
+        aUST.safeIncreaseAllowance(optRouter, type(uint256).max);
+    }
+
+    function setExchangeRateFeederData(address _feederData) public onlyBridgeFactoryOrPoolAdmin {
+        feederData = ExchangeRateFeederData(_feederData);
+    }
+
+    function setExchangeRateFeeder(address _exchangeRateFeeder)
+        public onlyBridgeFactoryOrPoolAdmin
+    {
+        feeder = IExchangeRateFeeder(_exchangeRateFeeder);
+    }
+
+    function setDepositAllowance(bool _allow) public onlyBridgeFactoryOrPoolAdmin {
+        isDepositAllowed = _allow;
+    }
+
+    function setRedemptionAllowance(bool _allow) public onlyBridgeFactoryOrPoolAdmin {
+        isRedemptionAllowed = _allow;
+    }
+
+    function setCaller(address _caller) public onlyBridgeFactoryOrPoolAdmin {
+        caller = _caller;
+    }
+
+    function setBridgeFee(uint256 _bridgeFee) public onlyBridgeFactoryOrPoolAdmin {
+        bridgeFee = _bridgeFee;
+    }
+
+    function setSwapFee(uint256 _swapFee) public onlyBridgeFactoryOrPoolAdmin {
+        swapFee = _swapFee;
+    }
+
+    function setTax(uint256 _stabilityFee) public onlyBridgeFactoryOrPoolAdmin {
+        stabilityFee = _stabilityFee;
+    }
+
+    function getBridgeFee() public view override returns (uint256) {
+        return bridgeFee;
+    }
+
+    function getSwapFee() public view override returns (uint256) {
+        return swapFee;
+    }
+
+    function getTax() public view override returns (uint256) {
+        return stabilityFee;
+    }
+
+
+    function setRequireCaller(bool _tf) public onlyBridgeFactoryOrPoolAdmin {
+        requireCaller = _tf;
+    }
+
+    // only accepts aUST
+    function wrapped() public view override returns (address) {
+        return address(aUST);
+    }
+
+    function underlying() public view override returns (address) {
+        return address(inputToken);
+    }
+
+    function initData() public override returns (uint256, uint256) {
+        (   ExchangeRateFeederData.Status status,
+            uint256 exchangeRate,
+            uint256 period,
+            uint256 weight,
+            uint256 lastUpdatedAt
+        ) = feederData.tokens(address(UST));
+
+        // apr
+        uint256 interestRate = weight.sub(1e18).mul(ONE_YR.div(period));
+        tokenData = TokenData({
+            status: status,
+            exchangeRate: exchangeRate,
+            period: period,
+            weight: weight,
+            lastUpdatedAt: lastUpdatedAt,
+            interestRate: interestRate
+        });
+        return (interestRate, exchangeRate);
+    }
+
+    function updateData() public override returns (uint256, uint256) {
+        (   ExchangeRateFeederData.Status status,
+            uint256 exchangeRate,
+            uint256 period,
+            uint256 weight,
+            uint256 lastUpdatedAt
+        ) = feederData.tokens(address(UST));
+
+        uint256 _weight = tokenData.weight;
+        uint256 _period = tokenData.period;
+
+        // apr
+        uint256 interestRate = weight.sub(1e18).mul(ONE_YR.div(period));
+
+        tokenData = TokenData({
+            status: status,
+            exchangeRate: exchangeRate,
+            period: period,
+            weight: weight,
+            lastUpdatedAt: lastUpdatedAt,
+            interestRate: interestRate
+        });
+
+        return (interestRate, exchangeRate);
+    }
+
+
+    function getInterestData() external view override returns (uint256, uint256) {
+        (   ExchangeRateFeederData.Status status,
+            uint256 exchangeRate,
+            uint256 period,
+            uint256 weight,
+            uint256 lastUpdatedAt
+        ) = feederData.tokens(address(UST));
+        // apr
+        uint256 interestRate = weight.sub(1e18).mul(ONE_YR.div(period));
+        uint256 currentTimestamp = block.timestamp;
+        uint256 timeDelta = currentTimestamp.sub(lastUpdatedAt);
+        uint256 _exchangeRate = calculateSimulatedExchangeRate(exchangeRate, timeDelta, interestRate);
+        return (interestRate, _exchangeRate);
+
+    }
+
+    function calculateSimulatedExchangeRate(uint256 previousIndex, uint256 timeDelta, uint256 rate) internal view returns (uint256) {
+        if (timeDelta == 0) {
+            return previousIndex;
+        }
+        // inspired by aave p
+        return rate.div(ONE_YR).add(ONE).wadPow(timeDelta).wadMul(previousIndex);
+    }
+
+    function simulateGas() public view returns (uint256) {
+        // gas_fees = ((gas * gas_price)/1e6)
+        return anchorGasTx.wadMul(uusdGasRate.div(uint256(1e6)));
+    }
+
+    /* modifier onlyBridgeFactoryOrPoolAdmin() {
+        require(true);
+        _;
+    } */
+
+    modifier onlyBridgeFactoryOrPoolAdmin() {
+        require(msg.sender == addressesProvider.getBridgeFactory() || msg.sender == addressesProvider.getPoolAdmin());
+        _;
+    }
+
+    /* modifier onlyCaller() {
+      console.log("msg.sender", msg.sender);
+      console.log("caller", caller);
+
+      require(
+        (msg.sender == caller) && requireCaller,
+        "Error: Only caller."
+      );
+      _;
+    } */
+
+    /* modifier onlyCaller() {
+      console.log("msg.sender", msg.sender);
+      console.log("caller    ", caller);
+
+      require(
+        (msg.sender == caller),
+        "Error: Only caller."
+      );
+      _;
+    } */
+
+
+    // publically available function
+    // do not use as we are able to update parameters - isDepositAllowed, inputToken, etc.
+    function deposit(uint256 _amount, uint256 _minAmountOut, address to)
+        public
+        override
+        returns (uint256)
+    {
+        require(isDepositAllowed, "ConversionPool: deposit not stopped");
+
+        inputToken.safeTransferFrom(_msgSender(), address(this), _amount);
+
+        // swap for UST
+        if (address(UST) != address(inputToken)) {
+            // swap to UST
+            swapper.swapToken(
+                address(inputToken),
+                address(UST),
+                _amount,
+                _minAmountOut,
+                address(this)
+            );
+        }
+
+        uint256 ust = UST.balanceOf(address(this));
+        console.log("in deposit deposit ust", ust);
+        // check swap in amount
+        // send to optRouter
+        // router then sends to `to`
+        IConversionRouterV2(optRouter).depositStable(to, ust);
+
+        return depositAmountMinusFees(ust);
+    }
+
+    // update decimals before calling to ust
+    function depositAmountMinusFees(uint256 amount) public view override returns (uint256) {
+      // eth ---> shuttle ---> terra
+      console.log("in depositAmountMinusFees amount", amount);
+
+      // est amount landed in anchor after all fees - Bridge, Terra Tax
+      // 100 * .001 = .1
+      uint256 _bridgeFee = amount.wadMul(bridgeFee);
+      console.log("in depositAmountMinusFees after _bridgeFee");
+
+      if (_bridgeFee < minBridgeCost) {
+          // if .1 > 1.0
+          // _bridgeFee = 1.0
+          _bridgeFee = minBridgeCost;
+      }
+      // after bridge
+      // 100 - 1 = 99
+      console.log("in depositAmountMinusFees after amount", amount);
+      console.log("in depositAmountMinusFees after _bridgeFee", _bridgeFee);
+
+      uint256 bridgedAmount = amount.sub(_bridgeFee);
+      console.log("in depositAmountMinusFees after bridgedAmount");
+
+      // 99 * .0035 = 0.3465
+      uint256 _stabilityFee = bridgedAmount.wadMul(stabilityFee);
+
+      console.log("in depositAmountMinusFees after _stabilityFee");
+
+      if (_stabilityFee > sdtPrice) {
+          // if 0.3465 > 1.24
+          // _stabilityFee = 0.3465
+          _stabilityFee = sdtPrice;
+      }
+      // 100 - 1 - 0.3465 = 98.6535
+      return amount.sub(_bridgeFee).sub(_stabilityFee);
+
+    }
+
+    // _amount is in aust decimals - same as ust
+    // amountReturned inputToken decimals
+    function redeem(uint256 _amount, address to) public override returns (uint256) {
+        require(isRedemptionAllowed, "Error: redemption not allowed");
+
+        // transfer aUST in
+        aUST.safeTransferFrom(_msgSender(), address(this), _amount);
+
+        uint256 amountReturned = _amount;
+        // redeem aUST for UST and then swap for inputToken
+        // inputToken is non-UST
+        // if user has avaDAI, swap to DAI through ethanchor
+        // this is a bridge event.  Expect delays and risk
+        // all swapping happens at ethanchor
+        if (address(UST) != address(inputToken)) {
+            // swap to inputToken
+            // this takes aUST and gets back inputToken to `to`
+            IConversionRouterV2(optRouter).redeemStable(
+                to, // operator
+                _amount, // swap out amount aust -> ust -> inputToken
+                address(swapper), // curve
+                address(inputToken) // dai
+            );
+            // adjust for swap fees
+            /* amountReturned = _amount.wadMul(uint256(1e18).sub(swapFee)); */
+
+            // assume amount of input token returned from aust
+            // this is done by anchor
+            // terra -> shuttle -> eth -> swap -> to
+            amountReturned = redeemWithSwapAmountMinusFees(_amount);
+            console.log("in redeem", amountReturned);
+
+        } else {
+            // this method swaps aust for inputToken
+            IRouterV2(optRouter).redeemStable(
+                to, // operator
+                _amount // swap out amount
+            );
+
+            amountReturned = redeemAmountMinusFees(amountReturned);
+        }
+
+        return amountReturned;
+    }
+
+    function redeemAmountMinusFees(uint256 amount) public view override returns (uint256) {
+        // terra ---> shuttle ---> eth
+
+        uint256 _stabilityFee = amount.wadMul(stabilityFee);
+        if (_stabilityFee > sdtPrice) {
+            _stabilityFee = sdtPrice;
+        }
+        amount = amount.sub(_stabilityFee);
+
+        // twice on withdraw
+        _stabilityFee = amount.wadMul(stabilityFee);
+        if (_stabilityFee > sdtPrice) {
+            _stabilityFee = sdtPrice;
+        }
+        amount = amount.sub(_stabilityFee);
+
+        // then bridge back to ethereum
+        uint256 _bridgeFee = amount.wadMul(bridgeFee);
+        if (_bridgeFee < minBridgeCost) {
+            _bridgeFee = minBridgeCost;
+        }
+        return amount.sub(_bridgeFee);
+    }
+
+    // amount is adj to ust decimal in avatoken before calling redeem
+    function redeemWithSwapAmountMinusFees(uint256 amount) public view returns (uint256) {
+        // terra ---> shuttle ---> eth
+        uint256 _stabilityFee = amount.wadMul(stabilityFee);
+        if (_stabilityFee > sdtPrice) {
+            _stabilityFee = sdtPrice;
+        }
+        amount = amount.sub(_stabilityFee);
+
+        // twice on withdraw
+        _stabilityFee = amount.wadMul(stabilityFee);
+        if (_stabilityFee > sdtPrice) {
+            _stabilityFee = sdtPrice;
+        }
+        amount = amount.sub(_stabilityFee);
+
+        // then bridge back to ethereum
+        uint256 _bridgeFee = amount.wadMul(bridgeFee);
+        if (_bridgeFee < minBridgeCost) {
+            _bridgeFee = minBridgeCost;
+        }
+        console.log("in redeemWithSwapAmountMinusFees", _bridgeFee);
+        console.log("in redeemWithSwapAmountMinusFees", amount.sub(_bridgeFee));
+
+        // get amount bacck from uniswap including fees
+        return swapper.getAmountOutMin(
+            address(UST),
+            address(inputToken), // non-ust
+            amount.sub(_bridgeFee)
+        );
+    }
+
+    /* function getExchangeRate(bool _simulate) public view override returns (uint256) {
+        return feeder.exchangeRateOf(address(UST), true);
+    } */
+
+}

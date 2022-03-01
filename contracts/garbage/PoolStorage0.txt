@@ -1,0 +1,232 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+
+/**
+ * @title PoolStorage
+ * @author Advias
+ * @title Protocol storage
+ */
+contract PoolStorage {
+
+    // each asset will be collateral or depositable or both
+    // all depositable assets are debtable
+    // poolAssets[asset]
+
+    /**
+     * @dev All parameters for each underlying asset money market
+     *
+     * Parameters:
+     *
+     * General
+     * - `asset`
+     * - `decimals` - Decimals of unerlying asset, all wrapped asset will match the underlying assets decimals
+     * - `wrapped` - The savings avasToken for the pool asset
+     * - `isCollateral`
+     * - `isUST`
+     * - `isSavings`
+     * - `isDebt`
+     * - `isStable`
+     * - `on` - If asset can be used
+     * - `router` - Router address responsible for Anchor or other integration
+     * - `exchangeRateData` - Data responsible for returning integrated asset data
+     * - `depositsSuppliedExchangeRate` - Exchange ra
+     * - `depositsSuppliedInterestRateFactor`
+     * - `depositsSuppliedInterestRate`
+     * - `totalDepositsLendable`
+     * - `overallExchangeRate`
+     * - `collateralAssetWrapped`
+     * - `collateralInterestRateFactor`
+     * - `collateralExchangeRate`
+     * - `ctd`
+     * - `debtWrappedAsset`
+     * - `borrowExchangeRate`
+     * - `borrowInterestRate`
+     * - `maxDebtLiquidationFactor`
+     * - `debtInterestRateFactor`
+     * - `ltv`
+     * - `maxCtdLiquidationThreshold`
+     * - `liquidationThreshold`
+     * - `minDebtThresholdValue`
+     * - `liquidationBonusFactor`
+     * - `collateralLiquidityBufferFactor`
+     * - `savingsLiquidityBufferFactor`
+     * - `bridgeExchangeRate`
+     * - `bridgeInterestRate`
+     * - `bridgeMinSupplyRedeemAmount`
+     * - `bridgeMaxSupplyRedeemAmount`
+     * - `lastUpdatedTimestamp`
+     * - `vault`
+     * - `vaultFactor`
+     * - `reserve`
+     * - `reserveFactor`
+     * - `treasury`
+     * - `treasuryFactor`
+     **/
+
+    struct PoolAsset {
+        address asset; // underlying
+        uint256 decimals;
+        address wrapped; // AvaToken savinsg
+
+        // == typee
+        bool isCollateral; // can be used as collateral
+        bool isUST;
+        bool isSavings;
+        bool isDebt; // scalability
+        bool isStable; // scalability
+
+        bool on;
+
+
+        address router;
+        address exchangeRateData;
+        // == liquidation guidelines
+        /* uint256 minDebtTimeframe; // when borrower can repay */
+        /* uint256 maxDebtTimeframe; // up to when borrower can repay and after when liquidation can occur */
+        /* uint256 fullLiquidationTimeframe; // time where liquidator receives full collateral value instead of liquidationBonusFactorOnSpread */
+
+        // == bridged savings
+        uint256 depositsSuppliedExchangeRate; // bridge deposits
+        uint256 depositsSuppliedInterestRateFactor; // percentage of interest rate to account for from bridge
+        uint256 depositsSuppliedInterestRate;
+
+        // only use if tracking manually.  Otherwise use lendableExchangeRate lendableExchangeRateFactor
+        // only used for calculations for depositor interest rates and not for borrowing
+        // simulates balanceee + repay backd
+        uint256 totalDepositsLendable; // tracked manually due to possible rebalance errors
+
+        /* uint256 lendableExchangeRate; // lended deposits */
+        /* uint256 lendableExchangeRateFactor; // SAME AS debtInterestRateFactor */
+
+        uint256 overallExchangeRate;
+
+        // `if` isCollateral
+        address collateralAssetWrapped;
+        uint256 collateralInterestRateFactor; // amount of exchange rate to account for.  We need to cover fees
+        uint256 collateralExchangeRate;
+        uint256 ctd;
+
+        // rebalances
+        /* uint256 lastRebalanceTimestamp; */
+
+        // debt
+        address debtWrappedAsset;
+        uint256 borrowExchangeRate;
+        uint256 borrowInterestRate;
+        /* uint256 maxAmortizationTime; // max time borrowe rhas to amortize debt */
+        uint256 maxDebtLiquidationFactor;
+
+        /* uint256 borrowBridgeTotalScaledSupply; // calculated inside debtWrappedAsset */
+        uint256 debtInterestRateFactor; // bridgeInterestRate * debtInterestRateFactor = debtInterestRate (savings and debt rate)
+        uint256 ltv; // 1e18
+
+        uint256 maxCtdLiquidationThreshold; // 1e18
+
+        uint256 liquidationThreshold; // 1e18
+
+        /* uint256 stableAssetLiquidationThreshold; // 1e18 */
+
+
+        /* uint256 loanThresholdSeconds; // (1e18*(1e18+borrowInterestRate/ONE_YR)**loanThresholdSeconds) */
+        /* uint256 liquidationBonusFactorOnSpread; // % of collateral sent to liquidator */
+        /* uint256 maxDebtRepayFactor; // max % of debt to be repaid during liquidations */
+        uint256 minDebtThresholdValue; // if debt below this amount then 100% of debt can be repaidd
+        uint256 liquidationBonusFactor; // % of collateral sent to liquidator
+        /* uint256 maxCollateralBonusFactor; // amount of collateral gained borrower can use against ltv formula */
+
+        uint256 collateralLiquidityBufferFactor; // amount between contract aust amount and min needed amount, remaining goes to liquidity vault
+        uint256 savingsLiquidityBufferFactor; // amount between contract aust amount and min needed amount, remaining goes to liquidity vault
+        // fake
+        /* uint256 collateralBonusFactor; */
+        // check min bonus instead
+        /* bool allowBonus; // allow bonus against debt */
+
+
+        /* uint256 debtRepayBuffer; // unix after a repay to allow borrwer to repay again */
+
+
+        // anchor
+        /* address bridgeAddress; // address to router or conversionPool on anchor */
+        /* address bridgeExchangeRateFeederAddress; // gets exchange rates */
+        /* address bridgeWrappedAsset; // aUST | aDAI */
+        /* uint256 bridgeDepositFee; */
+        /* uint256 bridgeRedeemFee; */
+
+        /* uint256 realBridgeExchangeRate; // storeed byways of anchor exchangeRateFeeder */
+        /* uint256 realBridgeInterestRate; // eestimated by exchangeRateFeeder */
+
+        /* address bridgeConversionPoolAddress; // ConversionPoolV3 */
+        uint256 bridgeExchangeRate; // storeed byways of anchor exchangeRateFeeder
+        uint256 bridgeInterestRate; // estimated by exchangeRateFeeder
+        uint256 bridgeMinSupplyRedeemAmount; // min amount bridge allows
+        uint256 bridgeMaxSupplyRedeemAmount; // max amount bridge allows
+        /* uint256 bridgeMaxSupplyAllottedFactor; // % of supply can go to bridge from savings */
+
+        // general
+        /* uint256 maxDebtPercentage; // max % vs totaly supply */
+        uint256 lastUpdatedTimestamp;
+        address vault;
+        uint256 vaultFactor; // wad Percentage to go into vault (fee or usee as dividends)
+        address reserve;
+        uint256 reserveFactor; // wad Percentage to go into insurance wallet
+        address treasury;
+        uint256 treasuryFactor;
+
+        /* bool allowRebalance; */
+    }
+
+    /* struct UserData {
+        uint256 lastAmortizationTimestamp;
+        uint256 startTimestamp;
+        bool borrowing;
+    } */
+
+    /* struct Position {
+        address user;
+        address debtAsset;
+        uint256 lastAmortizationTimestamp;
+        address collateralAsset;
+        uint256 startTimestamp;
+        bool borrowing;
+        uint256 id;
+    } */
+
+    /* positions[collateral][debt][user] */
+    /* mapping(address => mapping(address => mapping(address => Position))) internal positions; */
+    /* mapping(address => address => mapping(address => Position)) internal positions; */
+
+    /* mapping(address => mapping(address => (address => Position))) internal positions; */
+
+    /* positions[collateral][debt][id] */
+    /* mapping(address => mapping(address => mapping(address => mapping(uint256 => Position)))) internal positions; */
+
+
+    mapping(address => PoolAsset) internal poolAssets;
+    /* mapping(address => UserData) internal usersData; */
+    /* mapping(address => mapping(address => UserData)) internal usersData; */
+
+    /* mapping(address => UserData) internal usersData; */
+
+    // poolAssets[asset][wrapped]
+    // this is the way incase we want to add the samee asset as a new pair
+    mapping(uint256 => address) public poolAssetsList; // count is always the same
+    uint256 public poolAssetsCount;
+
+    /* mapping(uint256 => address) public collateralAssetsList; */
+    uint256 public collateralAssetsCount;
+    /* uint256 internal maxCollateralAssetsCount = 1; */
+
+    /* mapping(uint256 => address) public savingsAssetsList; */
+    uint256 public savingsAssetsCount;
+    uint256 public debtAssetsCount;
+
+    bool internal paused;
+
+    IPoolAddressesProvider internal addressesProvider;
+
+    /* uint256 internal partialLiquidationFactor; // liquidation percentage of debt when using ltv ratio
+    uint256 internal minPartialLiquidationValueInEth; // > partial, else 100% liquidation
+    uint256 internal ctdLiquidationFactor; // liquidation percentage of debt when using ctd ratio */
+
+}

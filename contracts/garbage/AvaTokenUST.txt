@@ -1,0 +1,503 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {IPool} from '../pool/IPool.sol';
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IPoolAddressesProvider} from '../pool/IPoolAddressesProvider.sol';
+import {IBridge} from '../anchor/IBridge.sol';
+import {IRouter} from '../anchor/IRouter.sol';
+import {IExchangeRateData} from '../anchor/IExchangeRateData.sol';
+
+import {IAvaToken} from './IAvaToken.sol';
+import {IPoolAssetData} from '../pool/IPoolAssetData.sol';
+import {IRewardsBase} from './IRewardsBase.sol';
+import {RewardsTokenBase} from './RewardsTokenBase.sol';
+
+import "hardhat/console.sol";
+
+
+// represents wUST deposited
+// all underlying gets sent to anchor
+contract AvaToken is RewardsTokenBase, IAvaToken {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+  uint8 immutable private _decimals;
+
+  IPoolAddressesProvider public ADDRESSES_PROVIDER;
+  IPoolAssetData private _poolAssetData;
+  IPool private _pool;
+  IBridge private _bridge;
+
+  uint256 private _dividendSupply;
+  address private _dividendsAddress; // protocol token
+  uint256 private dividendFactor;
+
+  address private savingsTokenFactory;
+
+  IERC20 private _routerWrapped;
+  uint8 private _routerAssetDecimals;
+
+  IERC20 private _routerUnderlying;
+
+  address private _bridgeAddress;
+
+  address private reserve;
+
+  address internal _underlyingAsset; // wUST
+
+  uint256 private _bridgeTotalScaledSupply;
+  uint256 private _depositsSupplyTotalScaledSupply; // amount trackd at a discount
+  uint256 private _usedReserves; // bridge reserves for user fees
+
+  uint256 private totalLendPrincipal;
+  uint256 private totalLendScaledSupply;
+  /* string private _name;
+  string private _symbol; */
+
+  IRewardsBase internal _rewardsBase;
+
+  uint256 private liquidityVaultFactor;
+
+  /*
+  * - 0 = sharedTreasury
+  * - 1 = sharedTreasury
+  * - 2 = reserves
+  */
+
+  constructor(
+      address provider,
+      address underlyingAsset,
+      uint8 decimals
+  ) RewardsTokenBase("", "") {
+      string memory underlyingAssetName = IERC20Metadata(underlyingAsset).name();
+      string memory underlyingAssetSymbol = IERC20Metadata(underlyingAsset).symbol();
+
+      string memory name = string(abi.encodePacked("Advias ", underlyingAssetName));
+      string memory symbol = string(abi.encodePacked("avas", underlyingAssetSymbol));
+
+      _decimals = decimals;
+      _setDecimals(decimals);
+      _setName(name);
+      _setSymbol(symbol);
+
+      ADDRESSES_PROVIDER = IPoolAddressesProvider(provider);
+      _pool = IPool(ADDRESSES_PROVIDER.getPool());
+      _poolAssetData = IPoolAssetData(ADDRESSES_PROVIDER.getPoolAssetData());
+      savingsTokenFactory = ADDRESSES_PROVIDER.getSavingsTokenFactory();
+      _underlyingAsset = underlyingAsset;
+      initRouter();
+  }
+
+  function decimals() public view virtual override returns (uint8) {
+      return _decimals;
+  }
+
+  modifier onlyRewardsTokenFactory() {
+    require(msg.sender == address(ADDRESSES_PROVIDER.getRewardsTokenFactory()), "Error: Only rewards factory can be sender.");
+    _;
+  }
+
+  function setRewards(address _rewards) external override onlyRewardsTokenFactory {
+      _rewardsBase = IRewardsBase(_rewards);
+  }
+
+  // where to send dividend factor to
+  function setDividends(address to, uint256 factor) external override onlyPoolAdmin {
+      require(factor <= 1e18, "Error: Factor greater than max");
+      _dividendsAddress = to;
+      dividendFactor = factor;
+      _addRewardsBlacklist(to);
+  }
+
+  function _addRewardsBlacklist(address user) public onlyPoolAdmin {
+      addRewardsBlacklist(user);
+  }
+
+  function _removeRewardsBlacklist(address user) public onlyPoolAdmin {
+      removeRewardsBlacklist(user);
+  }
+
+
+  modifier onlyPool() {
+    require(msg.sender == address(_pool), "Error: Only pool can be sender.");
+    _;
+  }
+
+  modifier onlySavingsTokenFactory() {
+    require(msg.sender == savingsTokenFactory, "Error: Only fatory can be sender.");
+    _;
+  }
+
+  // amount = depositAmount - bridgeAmount
+  function mint_(address account, uint256 amount, uint256 supplyAmount, uint256 exchangeRate) external override onlyPool {
+      // supply to bridge
+      uint256 amountFromShared;
+
+      uint256 amountBack = supply(_bridgeAddress, amount);
+
+      uint256 scaledAmount = amountBack.wadDiv(exchangeRate);
+
+      _mint(account, scaledAmount);
+      emit Mint(account, amount, exchangeRate);
+  }
+
+  function mint(address account, uint256 amount, uint256 exchangeRate) external override onlyPool {
+
+      uint256 scaledAmount = amount.add(amountFromShared).wadDiv(exchangeRate);
+      _mint(account, scaledAmount);
+      emit Mint(account, amount, exchangeRate);
+  }
+
+  /* function mintToReserve(uint256 amount, uint256 exchangeRate) external override onlyPool {
+      if (amount == 0) {
+        return;
+      }
+
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+
+      address aaa = address(this);
+
+      _mint(aaa, scaledAmount);
+      _totalReserveSupply += scaledAmount;
+  } */
+
+  //the interest rate and exchange is is not dependent on totalSupply or totalScaledSupply so we are aable to
+  // mint outside of that
+  // we mint to an id to keep the assetss in the ccontract for gas efficienccy
+  // sharedTreasury is used for covering user fees
+  function mintToSharedTreasury(uint256 amount, uint256 exchangeRate) external override onlyPool {
+      if (amount == 0) {
+        return;
+      }
+
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+
+      uint256 dividendAmount;
+      if (
+          _dividendsAddress != address(0) ||
+          dividendFactor != 0
+      ) {
+          dividendAmount = scaledAmount.wadMul(dividendFactor);
+          // do not include in rewards
+          _mint(_dividendsAddress, dividendAmount);
+          _dividendSupply += dividendAmount;
+      }
+
+      // 1155ERC-AVA
+      _mint(
+          address(this),
+          0,
+          scaledAmount.sub(dividendAmount)
+      );
+      emit Mint(address(this), amount, exchangeRate);
+  }
+
+  /* function addToLiquidityVault() external onlyPoolAdmin {
+      _addToLiquidityVault();
+  }
+
+  function _addToLiquidityVault() internal {
+      ( , uint256 exchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+      uint256 balance = _routerWrapped.balanceOf(address(this)).wadMul(bridgeExchangeRate);
+
+      uint256 totalSupply = totaSupply();
+
+      if (totalSupply > balance) {
+          uint256 valueDelta = totalSupply.sub(balance);
+          uint256 amountDelta = valueDelta.wadDiv(bridgeExchangeRate);
+          uint256 amountToSend = amountDelta.wadMul(liquidityVaultFactor);
+          // semd liquidityVaultFactor, leave rest to appreciate
+          if (amountDelta <= 1e18) { return; }
+          if (anchorVaultRouter.vaultOpenAndUSTAvailable(amountToSend)) {
+              IAnchorVaultRouter(addressesProvider.getAnchorVaultRouter()).redeemStableNR(
+                  _underlyingAsset,
+                  amountDelta,
+                  vault
+              );
+          } else {
+              IBridge(bridge).redeem(
+                  amountDelta,
+                  to
+              );
+          }
+      }
+  } */
+
+  function dividendSupply() external view override returns (uint256) {
+      return _dividendSupply;
+  }
+
+  // deposit aUST into reserves
+  /* function depositReserves(uint256 amount) external {
+      _routerWrapped.transfer(address(this), amount);
+  } */
+
+  // used in mint
+  function supply(address bridge, uint256 amount) public override onlyPool returns (uint256) {
+      /* uint256 amountBack = IBridge(bridge).deposit(
+          amount,
+          0,
+          address(this)
+      ); */
+      console.log("in supply start");
+
+      ( , uint256 amountBack) = IRouter(ADDRESSES_PROVIDER.getRouter()).depositStable(
+          _underlyingAsset,
+          amount,
+          0,
+          address(this)
+      );
+
+
+      // amountBack is in bridge asset
+      console.log("in supply amountBack", amountBack);
+
+      ( , uint256 exchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+
+      _bridgeTotalScaledSupply = _bridgeTotalScaledSupply.add(amountBack.wadDiv(exchangeRate)); // estimates aUST back | mimics balanceOf - this is needed due to bridging done separately from tx
+
+      uint256 depositsSuppliedExchangeRate = _poolAssetData.getDepositsSuppliedExchangeRate(_underlyingAsset);
+      _depositsSupplyTotalScaledSupply = _depositsSupplyTotalScaledSupply.add(amountBack.mul(10**_decimals).div(10**_routerAssetDecimals).wadDiv(depositsSuppliedExchangeRate));
+
+      // deposits lendable referenced in avaToken underlying asset
+      _pool.updateTotalDepositsLendable(_underlyingAsset, 0, amount);
+
+      return amountBack.mul(10**_decimals).div(10**_routerAssetDecimals);
+
+      emit BridgeDeposit(
+          amountBack
+      );
+
+  }
+
+  function _redeem(address bridge, uint256 amount, address to, bool emergency) public override onlyPool returns (bool) {
+      ( , uint256 exchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+
+      // update to bridge decimals.  even if swapping to another asset we use ust
+      uint256 scaledAmount = (amount.mul(10**_routerAssetDecimals).div(10**_decimals)).wadDiv(exchangeRate);
+      /* uint256 scaledAmount = amount.wadDiv(exchangeRate); */
+
+      uint256 balanceAvailable = _routerWrapped.balanceOf(address(this));
+
+      if (!emergency) {
+          // if user is withddrawing and requires bridged asset, make sure we can accomodate
+          require(balanceAvailable > scaledAmount, "Error: Not enough balance to redeem from bridge.");
+      } else {
+          if (balanceAvailable < scaledAmount) {
+              scaledAmount = balanceAvailable;
+              amount = scaledAmount.wadMul(exchangeRate); // get value of underlying
+          }
+      }
+      console.log("in _redeem amountReturned", scaledAmount);
+      /* uint256 amountReturned = IBridge(bridge).redeem(
+          scaledAmount,
+          to
+      ); */
+      uint256 amountReturned = IRouter(ADDRESSES_PROVIDER.getRouter()).redeemStable(
+          scaledAmount,
+          address(this),
+          _underlyingAsset
+      );
+
+      // amountReturned referenced in avaToken underlying asset
+      if (!emergency) {
+          require(amountReturned > 0, "Error: Bridge amount return is zero.");
+      }
+
+
+      // manually tracking aUST total balanced to bridge
+      // this is tracking the actual amount and not the allotted amount for depositors
+      _bridgeTotalScaledSupply = _bridgeTotalScaledSupply.sub(scaledAmount);
+
+
+      // track the allotted amount for depositors from bridge
+      // this is discounted due to possible miscalculation errors betweeen bridging
+      uint256 depositsSuppliedExchangeRate = _poolAssetData.getDepositsSuppliedExchangeRate(_underlyingAsset);
+      /* _depositsSupplyTotalScaledSupply = _depositsSupplyTotalScaledSupply.sub(amountReturned.mul(10**_decimals).div(10**_routerAssetDecimals).wadDiv(depositsSuppliedExchangeRate)); */
+      _depositsSupplyTotalScaledSupply = _depositsSupplyTotalScaledSupply.sub(amountReturned.wadDiv(depositsSuppliedExchangeRate));
+
+      // update lendable if rebalance into contract
+      if (to == address(this)) {
+          _pool.updateTotalDepositsLendable(_underlyingAsset, amountReturned, 0);
+          /* _pool.updateTotalDepositsLendable(_underlyingAsset, amountReturned.mul(10**_decimals).div(10**_routerAssetDecimals), 0); */
+      }
+
+      emit BridgeRedeem(
+          to,
+          amount
+      );
+
+      return true;
+  }
+
+
+
+  function initRouter() public override {
+      address router = ADDRESSES_PROVIDER.getRouter();
+      uint256 MAX = ~uint256(0);
+      _routerWrapped = IERC20(IRouter(router)._wrappedAsset());
+      _routerUnderlying = IERC20(IRouter(router)._underlyingAsset());
+      _routerWrapped.approve(router, MAX);
+      IERC20(_underlyingAsset).approve(router, MAX);
+      _routerAssetDecimals = IERC20Metadata(address(_routerUnderlying)).decimals();
+  }
+
+  function totalScaledSupply() external view override returns (uint256) {
+      return super.totalSupply();
+  }
+
+  function totalSupply() public view override returns (uint256) {
+      uint256 simulateOverallExchangeRate = _poolAssetData.simulateOverallExchangeRate(_underlyingAsset);
+      return super.totalSupply().wadMul(simulateOverallExchangeRate);
+  }
+
+  function balanceOfScaled(address account) public view override returns (uint256) {
+      return super.balanceOf(account);
+  }
+
+  function balanceOf(address account) public view override returns (uint256) {
+      uint256 simulateOverallExchangeRate = _poolAssetData.simulateOverallExchangeRate(_underlyingAsset);
+      return super.balanceOf(account).wadMul(simulateOverallExchangeRate);
+  }
+
+  function bridgeTotalScaledSupply() public view override returns (uint256) {
+      return _bridgeTotalScaledSupply; // balance of aust
+  }
+
+  // total supply of UST available in anchor
+  // this is the absolute total we assume is there
+  function bridgeTotalSupply() public view override returns (uint256) {
+      ( , uint256 exchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+      return _bridgeTotalScaledSupply.wadMul(exchangeRate);
+  }
+
+  function depositsSuppliedTotalScaledSupply() public view override returns (uint256) {
+      return _depositsSupplyTotalScaledSupply;
+  }
+
+  function depositsSuppliedTotalSupply() public view override returns (uint256) {
+      uint256 depositsSuppliedExchangeRate = _poolAssetData.simulateDepositsSuppliedExchangeRate(_underlyingAsset);
+      return _depositsSupplyTotalScaledSupply.wadMul(depositsSuppliedExchangeRate);
+  }
+
+  modifier onlyPoolAdmin() {
+    require(msg.sender == address(ADDRESSES_PROVIDER.getPoolAdmin()), "Error: Only admin can be caller.");
+    _;
+  }
+
+  // removes extra anchor ust
+  // acts as part of commission
+  // aust acccumulates in appreciation over time from users redeeming on the bridge factor
+  function migrateAlpha(uint256 ratio) external onlyPoolAdmin {
+      require(ratio <= 1e18, "Error: Ratio too high");
+      uint256 balance = IERC20(address(_routerWrapped)).balanceOf(address(this));
+
+      if (_depositsSupplyTotalScaledSupply < balance) {
+          uint256 redeemAmount = balance.sub(_depositsSupplyTotalScaledSupply).wadMul(ratio);
+          IBridge(_bridgeAddress).redeem(
+              redeemAmount,
+              ADDRESSES_PROVIDER.getPoolAdmin()
+          );
+      }
+  }
+
+  /* function totalReservesScaled() external view returns (uint256) {
+      uint256 balance = _routerWrapped.balanceOf(address(this)); // balance of anchor ust
+      return balance;
+  } */
+
+  /* function totalReserves() public view returns (uint256) {
+      uint256 balanceScaled = _routerWrapped.balanceOf(address(this)); // balance of anchor ust
+      ( , uint256 exchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+      uint256 balance = balanceScaled.wadMul(exchangeRate);
+
+      uint256 bridgeFee = IBridge(_bridgeAddress).getBridgeFee();
+      uint256 tax = IBridge(_bridgeAddress).getTax();
+      uint256 balanceAdj;
+      if (_poolAssetData.getIsUST(_underlyingAsset)) {
+          // amount adjusted on bridge back
+          // assumed amount back after bridge fee and terra tax (taxed twice on withdraw)
+          balanceAdj = balance.wadMul(uint256(1e18).sub(tax)).wadMul(uint256(1e18).sub(tax)).wadMul(uint256(1e18).sub(bridgeFee));
+      } else {
+          uint256 swapFee = IBridge(_bridgeAddress).getSwapFee();
+          // balance including swap fees back to underlying asset UST >> _underlyingAsset
+          balanceAdj = balance.wadMul(uint256(1e18).sub(tax)).wadMul(uint256(1e18).sub(tax)).wadMul(uint256(1e18).sub(bridgeFee)).wadMul(uint256(1e18).sub(swapFee));
+      }
+      return balanceAdj.sub(_usedReserves);
+  } */
+
+  /* function totalReservesUsed(uint256 ratio) external view returns (uint256) {
+      return _usedReserves;
+  } */
+
+  // total amount loaned out
+  // used to get savings rate
+  function lendableTotalSupply() public view override returns (uint256) {
+      return _poolAssetData.simulateLendableTotalSupply(_underlyingAsset);
+  }
+
+  function lendableTotalSupplyPrincipal() public view override returns (uint256) {
+      return _poolAssetData.getTotalDepositsLendable(_underlyingAsset);
+  }
+
+  function transferUnderlyingTo(address account, uint256 amount) external override onlyPool returns (uint256) {
+      IERC20(_underlyingAsset).safeTransfer(account, amount);
+      return amount;
+  }
+
+  // redeeemedAmount is amount that is redeemed from anchor
+  // redeem done in pool in front
+  function burn_(address account, uint256 amount, uint256 redeemedAmount, uint256 exchangeRate) external override onlyPool {
+
+      uint256 amountScaled = amount.wadDiv(exchangeRate);
+      require(amountScaled != 0, "Error: Invalid burn amount");
+      _burn(account, amountScaled);
+      IERC20(_underlyingAsset).safeTransfer(account, amount.sub(redeemedAmount));
+
+      _pool.updateTotalDepositsLendable(_underlyingAsset, 0, amount.sub(redeemedAmount));
+
+      emit Burn(account, amount, exchangeRate);
+  }
+
+  function burnToCollateral(address account, uint256 amount, address _to, uint256 exchangeRate) external override onlyPool {
+      uint256 amountScaled = amount.wadDiv(exchangeRate);
+      require(amountScaled != 0, "Error: Invalid burn amount");
+      _burn(account, amountScaled);
+
+
+
+      ( , uint256 bridgeExchangeRate) = IExchangeRateData(ADDRESSES_PROVIDER.getExchangeRateData()).getInterestData();
+      uint256 toCollateralAmount = amount.wadDiv(bridgeExchangeRate);
+      _routerWrapped.safeTransfer(_to, toCollateralAmount);
+
+      emit Burn(account, amount, exchangeRate);
+  }
+
+
+  /**
+   * @dev For internal usage in the logic of the parent contract IncentivizedERC20
+   **/
+  function _getRewardsInstance() internal view override returns (IRewardsBase) {
+      return _rewardsBase;
+  }
+
+  /**
+   * @dev Returns the address of the incentives controller contract
+   **/
+  function getRewardsInstance() external view override returns (IRewardsBase) {
+      return _getRewardsInstance();
+  }
+
+  function getRouterUnderlying() external view override returns (address) {
+      return address(_routerUnderlying);
+  }
+
+}

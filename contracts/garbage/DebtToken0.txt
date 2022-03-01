@@ -1,0 +1,158 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {IPool} from '../pool/IPool.sol';
+
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IPoolAddressesProvider} from '../pool/IPoolAddressesProvider.sol';
+import {IDebtToken} from './IDebtToken.sol';
+import {IPoolAssetData} from '../pool/IPoolAssetData.sol';
+import {RewardsTokenBase} from './RewardsTokenBase.sol';
+import {IRewardsBase} from './IRewardsBase.sol';
+
+import "hardhat/console.sol";
+
+
+// represents wUST deposited
+// all underlying gets sent to anchor
+/* contract DebtToken is Initializable, ERC20Upgradeable, UUPSUpgradeable, OwnableUpgradeable, IDebtToken { */
+/* contract DebtToken is ERC20, IDebtToken { */
+contract DebtToken is RewardsTokenBase, IDebtToken {
+  using SafeMath for uint256;
+  using WadRayMath for uint256;
+  using SafeERC20 for IERC20;
+
+  IPoolAddressesProvider public ADDRESSES_PROVIDER;
+  IPoolAssetData private _poolAssetData;
+
+  IPool private _pool;
+
+  address internal _treasury; // where reserve factor goes as wrapped token
+  address internal _vault; // where fees go as wrapped token
+
+  address internal _underlyingAsset;
+
+  mapping(address => uint256) private _initialExchangeRates;
+
+  /* address internal _wrappedAsset; // represents the avaToken */
+  string private _name;
+  string private _symbol;
+
+  IRewardsBase internal _rewardsBase;
+
+  constructor(
+      address provider,
+      address underlyingAsset
+  ) RewardsTokenBase("", "") {
+      string memory underlyingAssetName = RewardsTokenBase(underlyingAsset).name();
+      string memory underlyingAssetSymbol = RewardsTokenBase(underlyingAsset).symbol();
+
+      string memory name = string(abi.encodePacked("dUST Terra Anchor ", underlyingAssetName));
+      string memory symbol = string(abi.encodePacked("dUST", underlyingAssetSymbol));
+
+      ADDRESSES_PROVIDER = IPoolAddressesProvider(provider);
+      _pool = IPool(ADDRESSES_PROVIDER.getPool());
+      _poolAssetData = IPoolAssetData(ADDRESSES_PROVIDER.getPoolAssetData());
+      _underlyingAsset = underlyingAsset;
+      _name = name;
+      _symbol = symbol;
+  }
+
+  function setRewards(address _rewards) external override onlyPool {
+      _rewardsBase = IRewardsBase(_rewards);
+  }
+
+  /* function initialize(
+      IPoolAddressesProvider provider,
+      address underlyingAsset
+  ) public initializer {
+      string memory underlyingAssetName = ERC20(underlyingAsset).name();
+      string memory underlyingAssetSymbol = ERC20(underlyingAsset).symbol();
+
+      string memory name = string(abi.encodePacked("Debt ", underlyingAssetName));
+      string memory symbol = string(abi.encodePacked("C", underlyingAssetSymbol));
+
+      __ERC20_init(name, symbol);
+
+      ADDRESSES_PROVIDER = provider;
+
+      _pool = IPool(ADDRESSES_PROVIDER.getPool());
+      _underlyingAsset = underlyingAsset;
+  }
+
+  function _authorizeUpgrade(address) internal override onlyOwner {} */
+
+  modifier onlyPool() {
+    require(msg.sender == address(_pool), "Error: Only pool can be sender.");
+    _;
+  }
+
+  function mint(address account, uint256 amount, uint256 exchangeRate) external override onlyPool {
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+      uint256 currentTimestamp = block.timestamp;
+
+      _initialExchangeRates[account] = exchangeRate;
+
+      _mint(account, scaledAmount);
+      /* emit Mint(account, amount, exchangeRate); */
+  }
+
+  function balanceOfScaled(address account) external view override returns (uint256) {
+      return super.balanceOf(account);
+  }
+
+  function balanceOfPrincipal(address account) external view override returns (uint256) {
+      return super.balanceOf(account).wadMul(_initialExchangeRates[account]);
+  }
+
+  function balanceOf(address account) public view virtual override returns (uint256) {
+      uint256 exchangeRate = _poolAssetData.simulateBorrowExchangeRate(_underlyingAsset);
+      /* console.log("ibdebt balanceOf exchangeRate", exchangeRate); */
+
+      return super.balanceOf(account).wadMul(exchangeRate);
+  }
+
+  function burn(address account, uint256 amount, uint256 exchangeRate) external override onlyPool {
+      /* console.log("ibdebt burn exchangeRate", exchangeRate); */
+      /* console.log("ibdebt burn balanceOf", balanceOf(account)); */
+
+      uint256 scaledAmount = amount.wadDiv(exchangeRate);
+      /* console.log("ibdebt burn scaledAmount", scaledAmount); */
+      _burn(account, scaledAmount);
+  }
+
+  function totalScaledSupply() external view override returns (uint256) {
+      return super.totalSupply();
+  }
+
+  function totalSupply() public view virtual override returns (uint256) {
+      uint256 exchangeRate = _poolAssetData.simulateBorrowExchangeRate(_underlyingAsset);
+      return super.totalSupply().wadMul(exchangeRate);
+  }
+
+
+  /**
+   * @dev For internal usage in the logic of the parent contract IncentivizedERC20
+   **/
+  function _getRewardsInstance() internal view override returns (IRewardsBase) {
+      return _rewardsBase;
+  }
+
+  /**
+   * @dev Returns the address of the incentives controller contract
+   **/
+  function getRewardsInstance() external view override returns (IRewardsBase) {
+      return _getRewardsInstance();
+  }
+
+
+}

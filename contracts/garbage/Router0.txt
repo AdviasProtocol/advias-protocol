@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+
+import {IExchangeRateFeeder} from "./interfaces/IExchangeRateFeeder.sol";
+import {IConversionRouterV2} from "./interfaces/IRouterV2.sol";
+import {IRouterV2} from "./interfaces/IRouterV2.sol";
+import {ExchangeRateFeederData} from './interfaces/IExchangeRateFeeder.sol';
+import {WadRayMath} from '../libraries/WadRayMath.sol';
+import {IPoolAddressesProvider} from '../pool/IPoolAddressesProvider.sol';
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+import {IBridgeV2} from "./IBridgeV2.sol";
+import {IAnchorVaultRouter} from "./IAnchorVaultRouter.sol";
+import {IAnchorVault} from "./IAnchorVault.sol";
+
+import {IRouter} from "./IRouter.sol";
+import {ISwapper} from "../swapper/ISwapper.sol";
+import "hardhat/console.sol";
+
+// routes to either terra bridge or protocol vault
+contract Router is IRouter {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+    using WadRayMath for uint256;
+
+    bool public vaultOpen;
+
+    IPoolAddressesProvider private addressesProvider;
+
+    IERC20 private AUST;
+    uint256 private AUSTDecimals = 18;
+    IERC20 private UST;
+    uint256 private USTDecimals = 18;
+
+    address private anchorVaultRouter;
+    address private bridge;
+
+    ISwapper private swapper;
+
+    uint256 public defaultMinOutFactor = 995000000000000000;
+
+    struct RouterAsset {
+        address asset;
+        uint256 decimals;
+        uint256 minOutFactor;
+        address swapper; // scalability for new assets which may not be stable assets
+        bool on;
+    }
+
+    uint256 internal routerAssetsCount;
+    mapping(uint256 => address) public routerAssetsList;
+    mapping(address => RouterAsset) public routerAssets;
+
+    function addRouterAssets(address[] memory assets) public onlyPoolAdmin {
+        for (uint256 i = 0; i < assets.length; i++) {
+            addRouterAsset(assets[i]);
+        }
+    }
+
+    function addRouterAsset(address asset) public onlyPoolAdmin {
+        RouterAsset storage routerAsset = routerAssets[asset];
+        uint256 assetDecimals = IERC20Metadata(asset).decimals();
+        routerAsset.asset = asset;
+        routerAsset.decimals = assetDecimals;
+        routerAsset.minOutFactor = defaultMinOutFactor;
+        routerAsset.on = true;
+        addRouterAssetToListInternal(asset);
+        IERC20(asset).safeIncreaseAllowance(address(swapper), type(uint256).max);
+        IERC20(asset).approve(addressesProvider.getBridge(), type(uint256).max);
+        IERC20(asset).approve(addressesProvider.getAnchorVaultRouter(), type(uint256).max);
+    }
+
+    function addRouterAssetToListInternal(address asset) internal {
+        uint256 _routerAssetsCount = routerAssetsCount;
+        bool assetAlreadyAdded = false;
+        for (uint256 i = 0; i < _routerAssetsCount; i++)
+            if (routerAssetsList[i] == asset) {
+                assetAlreadyAdded = true;
+            }
+        if (!assetAlreadyAdded) {
+            routerAssetsList[routerAssetsCount] = asset;
+            routerAssetsCount = _routerAssetsCount + 1;
+        }
+    }
+
+    constructor(
+        address _addressesProvider,
+        address _anchorVaultRouter,
+        address _bridge,
+        address _swapper,
+        address[] memory assets,
+        address _AUST,
+        address _UST
+    ) {
+        AUST = IERC20(_AUST);
+        UST = IERC20(_UST);
+        setAddressesProvider(_addressesProvider);
+        setAnchorVaultRouter(_anchorVaultRouter);
+        setBridge(_bridge);
+        vaultOpen = true;
+        setSwapper(_swapper);
+        addRouterAssets(assets);
+    }
+
+    modifier onlyPoolAdmin() {
+        require(msg.sender == addressesProvider.getPoolAdmin());
+        _;
+    }
+
+/* onlyPoolAdmin */
+    function setSwapper(address _swapper) public  {
+        swapper = ISwapper(_swapper);
+    }
+/* onlyPoolAdmin */
+    function setAddressesProvider(address _addressesProvider) public  {
+        addressesProvider = IPoolAddressesProvider(_addressesProvider);
+    }
+/* onlyPoolAdmin */
+    function setAnchorVaultRouter(address _anchorVaultRouter) public  {
+        UST.safeIncreaseAllowance(_anchorVaultRouter, type(uint256).max);
+        AUST.safeIncreaseAllowance(_anchorVaultRouter, type(uint256).max);
+    }
+/* onlyPoolAdmin */
+    function setBridge(address _bridge) public  {
+        UST.safeIncreaseAllowance(_bridge, type(uint256).max);
+        AUST.safeIncreaseAllowance(_bridge, type(uint256).max);
+    }
+
+    function _underlyingAsset() public view override returns (address) {
+        return address(UST);
+    }
+
+    function _wrappedAsset() public view override returns (address) {
+        return address(AUST);
+    }
+
+    function bridgeSupplyOnDepositSavings(
+        uint256 amountAdded, // 100
+        address savingsWrapped,
+        uint256 borrowInterestRate,
+        address debtWrappedAsset,
+        uint256 depositsSuppliedInterestRate,
+        uint256 decimals
+    ) external view returns (uint256) {
+        // 700
+
+        uint256 amountBridged = IAvaToken(savingsWrapped).depositsSuppliedTotalSupply();
+
+
+        // total value
+        // 1000 + 100 = 1100
+        uint256 totalSupply = IERC20(savingsWrapped).totalSupply().add(amountAdded); // total amount of assets lends and brige
+
+        // amount required repay (lends and bridge) to match debt APR
+        // 1100 * .14 = 154
+        uint256 amountToAchieve = totalSupply.wadMul(borrowInterestRate);
+
+        // repay amounts
+        // 0
+        uint256 totalDebtReturned = IERC20(debtWrappedAsset).totalSupply().wadMul(borrowInterestRate); // suedo debt returned yr (non-compounded)
+        // just in case
+        if (totalDebtReturned > amountToAchieve) { return 0; }
+
+        // difference to achieve
+         // 154 - 0 = 154
+
+        // amount needed to send to bridge to achieve difference
+
+        // accounting to depositors interest rate factor
+        // 154 / .2 = 770
+        uint256 amountToSupplyToBridgeToAchieveMatch = (amountToAchieve.sub(totalDebtReturned)).wadDiv(depositsSuppliedInterestRate);
+
+        uint256 amountBack = IRouter(router).depositAmountMinusFees(amountToSupplyToBridgeToAchieveMatch.mul(10**USTDecimals).div(10**decimals));
+
+        amountBack = amountBack.mul(10**decimals).div(10**USTDecimals);
+
+        uint256 feesAmount = amountToSupplyToBridgeToAchieveMatch.sub(amountBack);
+
+        // 773.86390479824937351671708897541 = ((770 / (1-.001)) / (1-.003)) / (1-.001)
+
+        uint256 amountToBridge = amountToSupplyToBridgeToAchieveMatch.add(feesAmount);
+
+        uint256 bridgeAmountToAdd = 0;
+        if (amountToBridge > amountBridged){
+            // 773.86390479824937351671708897541 - 700 = 73.86390479824937351671708897541
+            bridgeAmountToAdd = amountToBridge.sub(amountBridged);
+
+            if (bridgeAmountToAdd < poolAsset.bridgeMinSupplyRedeemAmount) {
+                bridgeAmountToAdd = 0;
+            }
+        }
+
+
+        return bridgeAmountToAdd;
+
+    }
+
+    function depositStable(address asset, uint256 _amount, uint256 _minAmountOut, address to) public override returns (bool, uint256) {
+        console.log("in depositStable start");
+
+        RouterAsset storage routerAsset = routerAssets[asset];
+        require(routerAsset.on, "Error: Router asset not active");
+
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), _amount);
+
+        uint256 amountBack;
+
+        if (address(UST) != routerAsset.asset) {
+            // swap to UST
+            swapper.swapToken(
+                routerAsset.asset,
+                address(UST),
+                _amount,
+                _minAmountOut,
+                address(this)
+            );
+        }
+
+        _amount = UST.balanceOf(address(this));
+        console.log("in depositStable _amount", _amount);
+
+        // check if vault has enough, else use bridge
+        bool usedVault = false;
+        if (IAnchorVault(addressesProvider.getAnchorVault()).vaultOpenAndAUSTAvailable(_amount)) {
+            amountBack = IAnchorVaultRouter(addressesProvider.getAnchorVaultRouter()).depositStable(asset, _amount, _minAmountOut, to);
+            usedVault = true;
+        } else {
+            amountBack = IBridgeV2(addressesProvider.getBridge()).deposit(asset, _amount, _minAmountOut, to);
+        }
+        return (usedVault, amountBack);
+    }
+
+    // _amount aust to redeem in return for ust value
+    function redeemStable(uint256 _amount, address to, address _outAsset) public override returns (uint256) {
+        console.log("in redeemStable start");
+        console.log("in redeemStable _amount", _amount);
+
+        RouterAsset storage routerAsset = routerAssets[_outAsset];
+        require(routerAsset.on, "Error: Router asset not active");
+        AUST.safeTransferFrom(msg.sender, address(this), _amount);
+        console.log("in redeemStable after safeTransferFrom");
+
+        uint256 amountBack;
+        // check if vault has enough, else use bridge
+        bool usedVault = false;
+        if (IAnchorVault(addressesProvider.getAnchorVault()).vaultOpenAndUSTAvailable(_amount)) {
+            console.log("in redeemStable in if start");
+
+            amountBack = IAnchorVaultRouter(addressesProvider.getAnchorVaultRouter()).redeemStable(routerAsset.asset, _amount, to);
+            usedVault = true;
+        } else {
+            console.log("in redeemStable in else start");
+
+            amountBack = IBridgeV2(addressesProvider.getBridge()).redeem(routerAsset.asset, _amount, to);
+        }
+        return amountBack;
+    }
+
+    // same as above but there no are reverts
+    function redeemStableNR(uint256 _amount, address to, address _outAsset) public override returns (uint256) {
+        RouterAsset storage routerAsset = routerAssets[_outAsset];
+        if (routerAsset.on) { return 0; }
+        uint256 amountBack;
+        // check if vault has enough, else use bridge
+        if (IAnchorVault(addressesProvider.getAnchorVault()).vaultOpenAndUSTAvailable(_amount)) {
+            amountBack = IAnchorVaultRouter(addressesProvider.getAnchorVaultRouter()).redeemStableNR(_outAsset, _amount, to);
+        } else {
+            amountBack = IBridgeV2(addressesProvider.getBridge()).redeem(_outAsset, _amount, to);
+        }
+        return amountBack;
+
+    }
+
+    function depositAmountMinusFees(uint256 _amount) external view override returns (uint256) {
+        uint256 amountBack;
+        if (IAnchorVault(addressesProvider.getAnchorVault()).vaultOpenAndUSTAvailable(_amount)) {
+            amountBack = _amount;
+        } else {
+            amountBack = IBridgeV2(addressesProvider.getBridge()).depositAmountMinusFees(_amount);
+        }
+        return amountBack;
+    }
+
+
+}

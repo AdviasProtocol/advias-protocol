@@ -1,0 +1,314 @@
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+import {WadRayMath} from '../../libraries/WadRayMath.sol';
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+import {ICollateral} from './ICollateral.sol';
+import {IBridge} from '../IBridge.sol';
+
+import "hardhat/console.sol";
+
+/* slither contracts/anchor/collateral/Collateral.sol */
+
+// contract taht is deployed per borrower to track aust
+contract Collateral is ICollateral {
+    using SafeMath for uint256;
+    using WadRayMath for uint256;
+    using SafeERC20 for IERC20;
+
+    address private account;
+    address private bridge;
+    address private vault;
+
+    address private caller; // wrapped collateral token
+
+    /* bool private firstRedeem; // used to accurately get aust contractBalance */
+
+    address private bridgeWrappedAsset;
+    address private bridgeUnderlying;
+
+    constructor(
+        address _account,
+        address _bridge,
+        address collateralAsset,
+        address collateralWrappedAsset,
+        address _vault
+    ) {
+        account = _account;
+        bridge = _bridge;
+        vault = _vault;
+        caller = msg.sender;
+
+        initBridge(
+          bridge,
+          collateralAsset,
+          collateralWrappedAsset
+        );
+    }
+
+    function initBridge(
+        address bridge,
+        address collateralAsset,
+        address collateralWrappedAsset
+    ) public {
+        bridgeWrappedAsset = IBridge(bridge).wrapped();
+        IERC20(bridgeWrappedAsset).approve(bridge, ~uint256(0));
+
+        IERC20(bridgeWrappedAsset).approve(vault, ~uint256(0));
+
+        bridgeUnderlying = IBridge(bridge).underlying();
+        IERC20(bridgeUnderlying).approve(bridge, ~uint256(0));
+
+    }
+
+    modifier onlyCaller() {
+      require(msg.sender == caller, "Error: Only token can be sender.");
+      _;
+    }
+
+    function supply(uint256 amount) external override returns (uint256) {
+        // amountBack is an est
+        // contract uses perccentages
+        uint256 amountBack = IBridge(bridge).deposit(
+            amount,
+            0,
+            address(this)
+        );
+        console.log("Collateral supply amountBack", amountBack);
+        require(amountBack != 0, "Error: Bridge failed.  Please try again later");
+
+        return amountBack;
+    }
+
+    /* the differencee betweeen what collatereal is and what is actually is */
+    /* function redeem(uint256 percentage, uint256 amount, uint256 borrowerValue, address receiver) external override returns (uint256) {
+        require(percentage <= 1e18, "Error: Percentage over 100%"); // 50%
+        // amount 500
+
+        // contractBalance of aUST in contract
+        // 995
+        uint256 contractBalance = IERC20(bridgeWrappedAsset).balanceOf(address(this));
+        // 1.1
+        uint256 ER = IBridge(bridge).getExchangeRate(true);
+
+        // borrowers designated collateral value in protocol
+        uint256 contractBalanceValue = contractBalance.wadMul(ER); // 1094.5
+
+        uint256 delta;
+        uint256 vaultCommission;
+        // if actual value > borrower allotted value
+        // trim off top, send to vault
+        if (contractBalanceValue > borrowerValue) {
+            // 94.5 = 1094.5 - 1000
+            delta = contractBalanceValue.sub(borrowerValue);
+            // 85.909090909090909090909090909091 = 94.5  / 1.1
+            // trim off excess
+            vaultCommission = delta.wadDiv(ER); // aust to transfer to vault
+        }
+
+        // amount aust to redeem to borrower
+        // 454.54545454545454545454545454545 = 500 / 1.1
+        uint256 redeemAmount = amount.wadDiv(ER);
+        // if 100%, send all minus commission
+        if (percentage >= 1e18) {
+            redeemAmount = contractBalance.sub(vaultCommission);
+        }
+        // if redeemAmount more than contractBalance, redeem what is available
+        // dont update commission, it gets checked after
+        if (redeemAmount > contractBalance) {
+            redeemAmount = contractBalance;
+        }
+
+        uint256 amountBack = IBridge(bridge).redeem(
+            redeemAmount,
+            receiver
+        );
+        require(amountBack > 0, "Error: Bridge failed.  Please try again later");
+
+        // contractBalance after redeem
+        // make sure no aust leftover on 100% redeem
+        uint256 _balance = IERC20(bridgeWrappedAsset).balanceOf(address(this));
+        if (vaultCommission > _balance && percentage == 1e18) {
+            vaultCommission = _balance;
+        }
+
+        // transfer to vault
+        if (vaultCommission != 0 && vaultCommission <= _balance) {
+            IERC20(bridgeWrappedAsset).transfer(vault, vaultCommission);
+        }
+
+        return amountBack;
+    } */
+
+    function getData(
+        uint256 amount,
+        uint256 borrowerValue
+    ) internal view returns (uint256, uint256) {
+        // borrowerValue = 1000
+        // amount = 500
+
+        // contractBalance of aUST in contract
+        // 995
+        uint256 contractBalance = IERC20(bridgeWrappedAsset).balanceOf(address(this));
+        // 1.1
+        uint256 ER = IBridge(bridge).getExchangeRate(true);
+
+        // value in this contract os ust
+        uint256 contractBalanceValue = contractBalance.wadMul(ER); // 1094.5
+
+        uint256 delta; // delta protocol allotted value of borrower vs in this contract
+        uint256 vaultCommission; // delta gets transfered to protocol
+        uint256 redeemAmount = amount.wadDiv(ER); // if contractBalanceValue == borrowerValue
+        if (contractBalanceValue > borrowerValue) {
+            // 94.5 = 1094.5 - 1000
+            delta = contractBalanceValue.sub(borrowerValue);
+            // 85.909090909090909090909090909091 = 94.5  / 1.1
+            // trim off excess
+            vaultCommission = delta.wadDiv(ER); // aust to transfer to vault
+            // keep redeemAmount the same and trim top
+        } else if (borrowerValue < contractBalanceValue) {
+            // it is possibl the est original return value was less
+            // if borrower redeems too quick in relation to appreciation > est return their protocol contractBalance will trump their actual
+            // if so, take a perccentage and not actual amount
+            uint256 redeemPercent = amount.wadDiv(borrowerValue);
+            uint256 redeemValue = contractBalanceValue.wadMul(redeemPercent);
+            redeemAmount = redeemValue.wadDiv(ER);
+        }
+
+        return (vaultCommission, redeemAmount);
+    }
+
+    /** @dev Redeems UST from anchor to receiver
+      * @param redeemFull If user is reddeeming full collateral contractBalance
+      * @param amount Amount to redeem from Anchor
+      * @param borrowerValue Value of users collateral in protocol formula
+      * @param receiver Either the borrower or liquidation caller.
+      * @return Amount back assumed from redeem
+    */
+    function redeem(bool redeemFull, uint256 amount, uint256 borrowerValue, address receiver) external override returns (uint256) {
+        (uint256 vaultCommission, uint256 redeemAmount) = getData(
+            amount,
+            borrowerValue
+        );
+        // borrowerValue = 1000
+        // amount = 500
+
+        // contractBalance of aUST in contract
+        // 995
+        /* uint256 contractBalance = IERC20(bridgeWrappedAsset).balanceOf(address(this));
+        // 1.1
+
+        ( , uint256 ER) = IBridge(bridge).getInterestData();
+
+        // value in this contract os ust
+        uint256 contractBalanceValue = contractBalance.wadMul(ER); // 1094.5
+
+        uint256 delta; // delta protocol allotted value of borrower vs in this contract
+        uint256 vaultCommission; // delta gets transfered to protocol
+        uint256 redeemAmount = amount.wadDiv(ER); // if contractBalanceValue == borrowerValue
+        if (contractBalanceValue > borrowerValue) {
+            // 94.5 = 1094.5 - 1000
+            delta = contractBalanceValue.sub(borrowerValue);
+            // 85.909090909090909090909090909091 = 94.5  / 1.1
+            // trim off excess
+            vaultCommission = delta.wadDiv(ER); // aust to transfer to vault
+            // keep redeemAmount the same and trim top
+        } else if (borrowerValue < contractBalanceValue) {
+            // it is possibl the est original return value was less
+            // if borrower redeems too quick in relation to appreciation > est return their protocol contractBalance will trump their actual
+            // if so, take a perccentage and not actual amount
+            uint256 redeemPercent = amount.wadDiv(borrowerValue);
+            uint256 redeemValue = contractBalanceValue.wadMul(redeemPercent);
+            redeemAmount = redeemValue.wadDiv(ER);
+        } */
+
+        // if 100%, send all minus commission `if` commission
+        /* if (redeemFull) {
+            redeemAmount = contractBalance.sub(vaultCommission);
+        } */
+        // if redeemAmount more than contractBalance, redeem what is available
+        // dont update commission, it gets checked after
+        /* if (redeemAmount > contractBalance) {
+            redeemAmount = contractBalance;
+        } */
+
+        uint256 amountBack = IBridge(bridge).redeem(
+            redeemAmount,
+            receiver
+        );
+
+        // contractBalance after redeem
+        // make sure no aust leftover on 100% redeem
+        uint256 _balance = IERC20(bridgeWrappedAsset).balanceOf(address(this));
+        if (vaultCommission > _balance && redeemFull) {
+            vaultCommission = _balance;
+        }
+
+
+        if (_balance == 0) {
+            vaultCommission = 0;
+        }
+
+        // reconfirm commission after previous check
+        // _balance should not be 0 but happen but can due to amountBack
+        // transfer to vault
+        if (vaultCommission != 0 && vaultCommission <= _balance) {
+            IERC20(bridgeWrappedAsset).transfer(vault, vaultCommission);
+        }
+
+        console.log("amount left in collateral contract", IERC20(bridgeWrappedAsset).balanceOf(address(this)));
+
+        return amountBack;
+    }
+
+
+    // manul collateral params
+
+    /* uint256 private _balance;
+    uint256 private _initialExchangeRate;
+
+    uint256 private _balanceAsCollaterall; //stored as integer no er
+
+    uint256 private _newDeposits;
+    uint256 private _newDepositsExchangeRate;
+
+    function supply_(uint256 amount) external override returns (uint256) {
+        uint256 ER = IBridge(bridge).getExchangeRate(true);
+        uint256 amountBack = IBridge(bridge).deposit(
+            amount,
+            0,
+            address(this)
+        );
+        return ER;
+    }
+
+    function contractBalance() public view returns (uint256) {
+        uint256 ER = IBridge(bridge).getExchangeRate(true);
+        return bridgeWrappedAsset.balanceOf(account).wadMul(ER);
+    }
+
+    function balancePrincipal() public view returns (uint256) {
+        uint256 ER = IBridge(bridge).getExchangeRate(true);
+        return bridgeWrappedAsset.balanceOf(account).wadMul(_initialExchangeRate);
+    }
+
+    function initiateBorrow(uint256 amount) external returns (uint256) {
+        uint256 principal = balancePrincipal();
+        uint255 availableCollateral = principal.sub(_balanceAsCollateral);
+        uint256 collateralToUse = availableCollateral < amount : amount ? availableCollateral;
+        _balanceAsCollateral = _balanceAsCollateral.add(collateralToUse);
+        return collateralToUse;
+    }
+
+
+    function accrue() internal {
+
+    } */
+
+
+}
